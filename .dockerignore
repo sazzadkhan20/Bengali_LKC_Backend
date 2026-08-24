@@ -1,0 +1,11 @@
+.git
+.gradle
+build
+.idea
+.vscode
+*.iml
+.env
+docker/postgres-data
+**/node_modules
+**/.next
+agent-transcripts
