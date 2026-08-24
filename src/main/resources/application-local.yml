@@ -1,0 +1,51 @@
+# Local development — Docker Compose auto-starts a dedicated Postgres server.
+# Flyway creates/migrates all tables on application startup.
+spring:
+  config:
+    activate:
+      on-profile: local
+
+  docker:
+    compose:
+      enabled: true
+      file: docker-compose.yml
+      lifecycle-management: start_only
+      readiness:
+        timeout: 120s
+      skip:
+        in-tests: true
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/bengali_lkc}
+    username: ${DB_USERNAME:lkc_admin}
+    password: ${DB_PASSWORD:lkc_secure_change_me}
+    hikari:
+      # Wait for Docker Postgres to become reachable (do not fail instantly)
+      connection-timeout: 30000
+      initialization-fail-timeout: 120000
+
+  jpa:
+    show-sql: false
+    hibernate:
+      # Flyway owns schema; Hibernate only validates after migrations
+      ddl-auto: validate
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    validate-on-migrate: true
+
+lkc:
+  bootstrap:
+    seed-demo-users: true
+    import-lexicon-xml: false
+  mail:
+    demo-expose-secrets: true
+  security:
+    cors:
+      allowed-origins: http://localhost:3000,http://127.0.0.1:3000
+
+logging:
+  level:
+    com.bengalilkc: DEBUG
+    org.springframework.boot.docker.compose: INFO

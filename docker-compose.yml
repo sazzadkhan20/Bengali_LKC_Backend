@@ -1,0 +1,96 @@
+# Bengali LKC — local / server orchestration
+#
+# Local (IntelliJ / bootRun): Spring Boot Docker Compose starts only `db`.
+# Manual DB only:   docker compose up -d db
+# Full stack:       docker compose --profile full up -d --build
+#
+# API:      http://localhost:8080
+# Swagger:  http://localhost:8080/swagger-ui.html
+# Postgres: localhost:5433  (container port 5432)
+
+name: bengali-lkc
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: bengali-lkc-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bengali_lkc}
+      POSTGRES_USER: ${POSTGRES_USER:-lkc_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lkc_secure_change_me}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      # Host 5433 avoids clash with a local Postgres already on 5432
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    networks:
+      - lkc-net
+    labels:
+      org.springframework.boot.service-connection: postgres
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: bengali-lkc-mailhog
+    profiles: ["dev"]
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - lkc-net
+
+  # Only started with: docker compose --profile full up -d --build
+  api:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bengali-lkc-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-prod}
+      SERVER_PORT: 8080
+      DB_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-bengali_lkc}
+      DB_USERNAME: ${POSTGRES_USER:-lkc_admin}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-lkc_secure_change_me}
+      JWT_SECRET: ${JWT_SECRET:-BengaliLKC-DevOnly-ChangeThisSecretKey-32charsMin!!}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      SEED_DEMO_USERS: ${SEED_DEMO_USERS:-false}
+      IMPORT_LEXICON_XML: ${IMPORT_LEXICON_XML:-false}
+      LEXICON_XML_PATH: /app/data/Bangla_Mono_Lingual_Lexicons.xml
+      MAIL_HOST: ${MAIL_HOST:-mailhog}
+      MAIL_PORT: ${MAIL_PORT:-1025}
+      MAIL_FROM: ${MAIL_FROM:-noreply@bengali-lkc.local}
+      DEMO_EXPOSE_SECRETS: ${DEMO_EXPOSE_SECRETS:-false}
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - ./Documents/Bangla Mono Lingual Lexicons.xml:/app/data/Bangla_Mono_Lingual_Lexicons.xml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      - lkc-net
+
+volumes:
+  postgres_data:
+    name: bengali-lkc-postgres-data
+
+networks:
+  lkc-net:
+    name: bengali-lkc-net
+    driver: bridge

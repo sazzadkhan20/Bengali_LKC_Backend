@@ -1,0 +1,38 @@
+# Production / university server profile
+spring:
+  config:
+    activate:
+      on-profile: prod
+
+  docker:
+    compose:
+      enabled: false
+
+  jpa:
+    show-sql: false
+    hibernate:
+      ddl-auto: validate
+
+  flyway:
+    validate-on-migrate: true
+
+server:
+  error:
+    include-message: never
+    include-stacktrace: never
+
+lkc:
+  bootstrap:
+    seed-demo-users: ${SEED_DEMO_USERS:false}
+    import-lexicon-xml: ${IMPORT_LEXICON_XML:false}
+  mail:
+    demo-expose-secrets: false
+  security:
+    cors:
+      allowed-origins: ${CORS_ORIGINS}
+
+logging:
+  level:
+    root: WARN
+    com.bengalilkc: INFO
+    org.springframework.security: WARN
