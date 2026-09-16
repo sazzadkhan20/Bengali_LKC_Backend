@@ -14,6 +14,9 @@ import org.springframework.stereotype.Service;
 @Service
 public class JwtService {
 
+    public static final String CLAIM_TOKEN_TYPE = "typ";
+    public static final String TYPE_ACCESS = "access";
+
     private final LkcProperties properties;
     private final SecretKey key;
 
@@ -23,19 +26,27 @@ public class JwtService {
         this.key = Keys.hmacShaKeyFor(secretBytes);
     }
 
-    public String createToken(String userId, String username, Role role, boolean mustChangePassword, long ttlMinutes) {
+    public String createAccessToken(
+            String userId, String username, Role role, boolean mustChangePassword, long ttlMinutes) {
         Instant now = Instant.now();
-        Instant exp = now.plusSeconds(ttlMinutes * 60);
+        Instant exp = now.plusSeconds(Math.max(ttlMinutes, 1) * 60);
         return Jwts.builder()
                 .issuer(properties.getSecurity().getJwt().getIssuer())
                 .subject(userId)
                 .claim("username", username)
                 .claim("role", role.name())
                 .claim("mustChangePassword", mustChangePassword)
+                .claim(CLAIM_TOKEN_TYPE, TYPE_ACCESS)
                 .issuedAt(Date.from(now))
                 .expiration(Date.from(exp))
                 .signWith(key, Jwts.SIG.HS256)
                 .compact();
+    }
+
+    /** @deprecated use {@link #createAccessToken} */
+    @Deprecated
+    public String createToken(String userId, String username, Role role, boolean mustChangePassword, long ttlMinutes) {
+        return createAccessToken(userId, username, role, mustChangePassword, ttlMinutes);
     }
 
     public Claims parse(String token) {
@@ -45,6 +56,19 @@ public class JwtService {
                 .build()
                 .parseSignedClaims(token)
                 .getPayload();
+    }
+
+    public Claims parseAccessToken(String token) {
+        Claims claims = parse(token);
+        String typ = claims.get(CLAIM_TOKEN_TYPE, String.class);
+        if (typ != null && !TYPE_ACCESS.equals(typ)) {
+            throw new IllegalArgumentException("Not an access token");
+        }
+        return claims;
+    }
+
+    public Instant expiration(String token) {
+        return parse(token).getExpiration().toInstant();
     }
 
     public boolean isValid(String token) {

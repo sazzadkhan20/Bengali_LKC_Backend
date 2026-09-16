@@ -3,9 +3,11 @@ package com.bengalilkc.web.controller;
 import com.bengalilkc.security.SecurityUtils;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.auth.AuthService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -23,9 +25,24 @@ public class AuthController {
         return authService.login(str(body.get("username")), str(body.get("password")), response);
     }
 
+    @PostMapping("/refresh")
+    public Map<String, Object> refresh(HttpServletRequest request, HttpServletResponse response) {
+        return authService.refresh(request, response);
+    }
+
+    /**
+     * Session payload used by the frontend after login and on every authenticated page load.
+     * Includes profile, permissions, standing, and access-token expiry (1 hour by default).
+     */
+    @GetMapping("/session")
+    public Map<String, Object> session(HttpServletRequest request) {
+        UserPrincipal principal = SecurityUtils.requirePrincipal();
+        return authService.session(principal, request);
+    }
+
     @PostMapping("/logout")
-    public Map<String, Object> logout(HttpServletResponse response) {
-        return authService.logout(response);
+    public Map<String, Object> logout(HttpServletRequest request, HttpServletResponse response) {
+        return authService.logout(request, response);
     }
 
     @PostMapping("/password-otp")
@@ -35,10 +52,15 @@ public class AuthController {
     }
 
     @PostMapping("/change-password")
-    public Map<String, Object> changePassword(@RequestBody Map<String, Object> body) {
+    public Map<String, Object> changePassword(
+            @RequestBody Map<String, Object> body, HttpServletResponse response) {
         UserPrincipal principal = SecurityUtils.requirePrincipal();
         return authService.changePassword(
-                principal, str(body.get("currentPassword")), str(body.get("otp")), str(body.get("newPassword")));
+                principal,
+                str(body.get("currentPassword")),
+                str(body.get("otp")),
+                str(body.get("newPassword")),
+                response);
     }
 
     @PostMapping("/forgot-password")
