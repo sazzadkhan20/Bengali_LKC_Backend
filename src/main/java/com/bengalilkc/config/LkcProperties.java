@@ -23,9 +23,16 @@ public class LkcProperties {
     public static class Jwt {
         private String secret;
         private String issuer = "bengali-lkc";
+        /** HttpOnly cookie holding the access JWT (1 hour session by default). */
         private String cookieName = "lkc_session";
+        /** HttpOnly cookie holding the opaque refresh token. */
+        private String refreshCookieName = "lkc_refresh";
         private String headerName = "Authorization";
         private String tokenPrefix = "Bearer ";
+        /** Access-token / session lifetime in minutes (overridden by system_config when present). */
+        private long accessTtlMinutes = 60;
+        /** Refresh-token lifetime in days. */
+        private long refreshTtlDays = 7;
     }
 
     @Data

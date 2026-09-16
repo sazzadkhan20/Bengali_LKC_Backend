@@ -47,8 +47,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                             && !user.isSuspended()
                             && credential != null
                             && !credential.isDeactivated()) {
-                        boolean mustChange = credential.isOneTime()
-                                || Boolean.TRUE.equals(claims.get("mustChangePassword", Boolean.class));
+                        // Live credential flag wins over stale JWT claims (e.g. after password change).
+                        boolean mustChange = credential.isOneTime();
                         UserPrincipal principal = new UserPrincipal(
                                 user.getId(),
                                 user.getUsername(),

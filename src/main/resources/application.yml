@@ -103,8 +103,12 @@ lkc:
       secret: ${JWT_SECRET:BengaliLKC-DevOnly-ChangeThisSecretKey-32charsMin!!}
       issuer: bengali-lkc
       cookie-name: lkc_session
+      refresh-cookie-name: lkc_refresh
       header-name: Authorization
       token-prefix: "Bearer "
+      # Access / session lifetime (minutes). system_config.session_timeout_minutes overrides at runtime.
+      access-ttl-minutes: ${JWT_ACCESS_TTL_MINUTES:60}
+      refresh-ttl-days: ${JWT_REFRESH_TTL_DAYS:7}
     cors:
       allowed-origins: ${CORS_ORIGINS:http://localhost:3000,http://127.0.0.1:3000}
       allowed-methods: GET,POST,PUT,PATCH,DELETE,OPTIONS
