@@ -22,7 +22,12 @@ public class AuthController {
 
     @PostMapping("/login")
     public Map<String, Object> login(@RequestBody Map<String, Object> body, HttpServletResponse response) {
-        return authService.login(str(body.get("username")), str(body.get("password")), response);
+        // Accept username, email, or identifier — all resolve to the same account lookup.
+        String identifier = firstNonBlank(
+                str(body.get("username")),
+                str(body.get("identifier")),
+                str(body.get("email")));
+        return authService.login(identifier, str(body.get("password")), response);
     }
 
     @PostMapping("/refresh")
@@ -65,10 +70,36 @@ public class AuthController {
 
     @PostMapping("/forgot-password")
     public Map<String, Object> forgotPassword(@RequestBody Map<String, Object> body) {
-        return authService.forgotPassword(str(body.get("identifier")));
+        String identifier = firstNonBlank(
+                str(body.get("identifier")),
+                str(body.get("username")),
+                str(body.get("email")));
+        return authService.forgotPassword(identifier);
+    }
+
+    @PostMapping("/forgot-password/confirm")
+    public Map<String, Object> confirmForgotPassword(@RequestBody Map<String, Object> body) {
+        String identifier = firstNonBlank(
+                str(body.get("identifier")),
+                str(body.get("username")),
+                str(body.get("email")));
+        return authService.confirmForgotPassword(
+                identifier, str(body.get("otp")), str(body.get("newPassword")));
     }
 
     private static String str(Object o) {
         return o == null ? null : String.valueOf(o);
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String v : values) {
+            if (v != null && !v.isBlank()) {
+                return v;
+            }
+        }
+        return null;
     }
 }
