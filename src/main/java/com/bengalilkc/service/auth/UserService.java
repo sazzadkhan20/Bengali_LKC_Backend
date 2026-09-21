@@ -1,7 +1,6 @@
 package com.bengalilkc.service.auth;
 
 import com.bengalilkc.common.exception.ApiException;
-import com.bengalilkc.config.LkcProperties;
 import com.bengalilkc.domain.entity.identity.AppUser;
 import com.bengalilkc.domain.entity.identity.Credential;
 import com.bengalilkc.domain.enums.AuditTargetType;
@@ -11,6 +10,7 @@ import com.bengalilkc.repository.identity.CredentialRepository;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.IdGeneratorService;
+import com.bengalilkc.service.mail.EmailService;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.LinkedHashMap;
@@ -19,6 +19,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -35,11 +37,68 @@ public class UserService {
     private final PasswordEncoder passwordEncoder;
     private final IdGeneratorService idGeneratorService;
     private final AuditService auditService;
-    private final LkcProperties properties;
+    private final EmailService emailService;
 
     @Transactional(readOnly = true)
     public List<Map<String, Object>> listUsers() {
         return userRepository.findAllByOrderByJoinedAtAsc().stream().map(this::toDto).toList();
+    }
+
+    /**
+     * Paginated User Management list — search (name / username / email), role, status.
+     * All filtering runs in the database for speed.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> listPaged(int page, int size, String q, String roleRaw, String statusRaw) {
+        int safeSize = size == 15 || size == 30 || size == 50 || size == 100 ? size : 15;
+        int safePage = Math.max(page, 0);
+        String query = q == null ? "" : q.trim();
+
+        Role role = null;
+        if (roleRaw != null && !roleRaw.isBlank() && !"ALL".equalsIgnoreCase(roleRaw.trim())) {
+            try {
+                role = Role.valueOf(roleRaw.trim());
+            } catch (Exception e) {
+                throw ApiException.unprocessable("Select a valid role filter.");
+            }
+        }
+
+        String status = "ALL";
+        if (statusRaw != null && !statusRaw.isBlank()) {
+            status = statusRaw.trim().toUpperCase();
+            if (!List.of("ALL", "ACTIVE", "SUSPENDED", "INACTIVE").contains(status)) {
+                throw ApiException.unprocessable("Select a valid status filter.");
+            }
+        }
+
+        Page<AppUser> result = userRepository.search(
+                query.isEmpty() ? null : query,
+                role,
+                "ALL".equals(status) ? null : status,
+                PageRequest.of(safePage, safeSize));
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("items", result.getContent().stream().map(this::toDto).toList());
+        body.put("page", result.getNumber());
+        body.put("size", result.getSize());
+        body.put("totalElements", result.getTotalElements());
+        body.put("totalPages", result.getTotalPages());
+        body.put("q", query);
+        body.put("role", role != null ? role.name() : "ALL");
+        body.put("status", status);
+        return body;
+    }
+
+    /** Lightweight payload for frontend duplicate checks before create. */
+    @Transactional(readOnly = true)
+    public Map<String, Object> listIdentifiers() {
+        List<AppUser> users = userRepository.findAllByOrderByJoinedAtAsc();
+        List<String> usernames = users.stream().map(u -> u.getUsername().toLowerCase()).toList();
+        List<String> emails = users.stream().map(u -> u.getEmail().toLowerCase()).toList();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("usernames", usernames);
+        body.put("emails", emails);
+        return body;
     }
 
     @Transactional(readOnly = true)
@@ -129,12 +188,14 @@ public class UserService {
         auditService.record(principal, "CREDENTIAL_ISSUED", AuditTargetType.CREDENTIAL, credId,
                 "One-time password emailed to " + email + "; change required at first login");
 
+        emailService.sendCredentialIssued(email, name, username, oneTimePassword);
+
         Map<String, Object> credBody = new LinkedHashMap<>();
         credBody.put("username", username);
         credBody.put("email", email);
-        if (properties.getMail().isDemoExposeSecrets()) {
-            credBody.put("demoOneTimePassword", oneTimePassword);
-        }
+        // Architect UI always receives the OTP once so issuance can be confirmed.
+        credBody.put("demoOneTimePassword", oneTimePassword);
+        credBody.put("emailSent", emailService.isConfigured());
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ok", true);

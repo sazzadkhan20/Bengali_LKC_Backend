@@ -16,6 +16,7 @@ import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.ConfigService;
 import com.bengalilkc.service.community.LeaderboardService;
+import com.bengalilkc.service.mail.EmailService;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -23,7 +24,6 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.UUID;
 import lombok.RequiredArgsConstructor;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
@@ -47,31 +47,53 @@ public class AuthService {
     private final AuditService auditService;
     private final UserService userService;
     private final LeaderboardService leaderboardService;
+    private final EmailService emailService;
     private final LkcProperties properties;
     private final Environment environment;
     private final SecureRandom secureRandom = new SecureRandom();
 
+    /**
+     * Sign in with username <em>or</em> registered email plus password.
+     * Field-level errors are returned under {@code username} / {@code password}
+     * so the login form can highlight only the failing field.
+     */
     @Transactional
-    public Map<String, Object> login(String username, String password, HttpServletResponse response) {
-        if (username == null || username.isBlank() || password == null || password.isBlank()) {
-            throw ApiException.badRequest("Username and password are required.");
+    public Map<String, Object> login(String identifier, String password, HttpServletResponse response) {
+        Map<String, String> fieldErrors = new LinkedHashMap<>();
+        String needle = identifier == null ? "" : identifier.trim();
+        String pass = password == null ? "" : password;
+
+        if (needle.isBlank()) {
+            fieldErrors.put("username", "Enter your username or email address.");
         }
-        Credential credential = credentialRepository.findByUsernameIgnoreCase(username.trim())
-                .orElse(null);
-        if (credential == null || !passwordEncoder.matches(password, credential.getPasswordHash())) {
-            throw ApiException.unauthorized(
-                    "Invalid username or password. Credentials are issued by the Platform Architect.");
+        if (pass.isBlank()) {
+            fieldErrors.put("password", "Enter your password.");
+        }
+        if (!fieldErrors.isEmpty()) {
+            throw ApiException.badRequest(fieldErrors);
+        }
+
+        Credential credential = resolveCredentialByUsernameOrEmail(needle);
+        if (credential == null) {
+            throw ApiException.unauthorized(Map.of(
+                    "username", "No account found with this username or email."));
+        }
+        if (!passwordEncoder.matches(pass, credential.getPasswordHash())) {
+            throw ApiException.unauthorized(Map.of(
+                    "password", "Incorrect password."));
         }
         if (credential.isDeactivated()) {
-            throw ApiException.unauthorized(
-                    "This credential has been deactivated by the Platform Architect.");
+            throw ApiException.unauthorized(Map.of(
+                    "username", "This credential has been deactivated by the Platform Architect."));
         }
         AppUser user = userRepository.findById(credential.getUserId()).orElse(null);
         if (user == null || !user.isActive()) {
-            throw ApiException.unauthorized("The account linked to this credential is inactive.");
+            throw ApiException.unauthorized(Map.of(
+                    "username", "The account linked to this credential is inactive."));
         }
         if (user.isSuspended()) {
-            throw ApiException.forbidden("This account is suspended pending Platform Architect review.");
+            throw ApiException.forbidden(
+                    "This account is suspended pending Platform Architect review.");
         }
 
         auditService.record(
@@ -87,6 +109,16 @@ public class AuthService {
         // One refresh session per login — revoke prior refresh tokens for this account.
         refreshTokenService.revokeAllForUser(user.getId());
         return issueAuthResponse(user, credential, response);
+    }
+
+    /** Resolve login credential by username (credential or user) or by registered email. */
+    private Credential resolveCredentialByUsernameOrEmail(String identifier) {
+        return credentialRepository.findByUsernameIgnoreCase(identifier)
+                .or(() -> userRepository.findByUsernameIgnoreCase(identifier)
+                        .flatMap(u -> credentialRepository.findByUserId(u.getId())))
+                .or(() -> userRepository.findByEmailIgnoreCase(identifier)
+                        .flatMap(u -> credentialRepository.findByUserId(u.getId())))
+                .orElse(null);
     }
 
     @Transactional
@@ -155,13 +187,13 @@ public class AuthService {
                 "Password-change OTP emailed to " + maskEmail(user.getEmail())
                         + " (valid " + OTP_VALIDITY_MINUTES + " min)");
 
+        emailService.sendPasswordChangeOtp(user.getEmail(), user.getName(), code, OTP_VALIDITY_MINUTES);
+
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ok", true);
         body.put("maskedEmail", maskEmail(user.getEmail()));
         body.put("validMinutes", OTP_VALIDITY_MINUTES);
-        if (properties.getMail().isDemoExposeSecrets()) {
-            body.put("demoOtp", code);
-        }
+        body.put("emailSent", emailService.isConfigured());
         return body;
     }
 
@@ -223,51 +255,153 @@ public class AuthService {
         return body;
     }
 
+    /**
+     * Step 1 — forgot password: resolve username/email and email a 6-digit OTP.
+     * Does not change the password until OTP is confirmed in step 2.
+     */
     @Transactional
     public Map<String, Object> forgotPassword(String identifier) {
         if (identifier == null || identifier.isBlank()) {
-            throw ApiException.badRequest("Enter your username or registered email address.");
+            throw ApiException.badRequest(Map.of(
+                    "identifier", "Enter your username or email address."));
         }
-        String needle = identifier.trim().toLowerCase();
-        AppUser user = userRepository.findByUsernameIgnoreCase(needle)
-                .or(() -> userRepository.findByEmailIgnoreCase(needle))
-                .orElse(null);
-        Credential credential = user == null ? null : credentialRepository.findByUserId(user.getId()).orElse(null);
+        AppUser user = resolveUserByUsernameOrEmail(identifier.trim());
+        Credential credential = user == null
+                ? null
+                : credentialRepository.findByUserId(user.getId()).orElse(null);
 
-        Map<String, Object> generic = new LinkedHashMap<>();
-        generic.put("ok", true);
-        generic.put("message",
-                "If the account exists, a password-reset email has been sent to the registered address.");
-
-        if (user == null || credential == null || credential.isDeactivated() || !user.isActive()) {
-            return generic;
+        if (user == null || credential == null) {
+            throw ApiException.unauthorized(Map.of(
+                    "identifier", "No account found with this username or email."));
+        }
+        if (credential.isDeactivated() || !user.isActive()) {
+            throw ApiException.unauthorized(Map.of(
+                    "identifier", "This account is inactive or deactivated."));
+        }
+        if (user.isSuspended()) {
+            throw ApiException.forbidden(
+                    "This account is suspended pending Platform Architect review.");
         }
 
-        String oneTimePassword = "reset-" + UUID.randomUUID().toString().substring(0, 8);
-        credential.setPasswordHash(passwordEncoder.encode(oneTimePassword));
-        credential.setOneTime(true);
+        String code = String.format("%06d", secureRandom.nextInt(1_000_000));
+        credential.setOtpCodeHash(passwordEncoder.encode(code));
+        credential.setOtpExpiresAt(Instant.now().plusSeconds(OTP_VALIDITY_MINUTES * 60L));
+        credentialRepository.save(credential);
+
+        auditService.record(
+                user.getId(),
+                user.getRole().name(),
+                "FORGOT_PASSWORD_OTP_SENT",
+                AuditTargetType.CREDENTIAL,
+                credential.getId(),
+                "Forgot-password OTP emailed to " + maskEmail(user.getEmail())
+                        + " (valid " + OTP_VALIDITY_MINUTES + " min)");
+
+        emailService.sendForgotPasswordOtp(
+                user.getEmail(), user.getName(), code, OTP_VALIDITY_MINUTES);
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ok", true);
+        body.put("maskedEmail", maskEmail(user.getEmail()));
+        body.put("validMinutes", OTP_VALIDITY_MINUTES);
+        body.put("emailSent", emailService.isConfigured());
+        body.put("passwordMinLength", configService.getConfig().getPasswordMinLength());
+        body.put("message",
+                "A verification code has been sent to " + maskEmail(user.getEmail()) + ".");
+        return body;
+    }
+
+    /**
+     * Step 2 — verify email OTP and set a new password (unauthenticated reset).
+     */
+    @Transactional
+    public Map<String, Object> confirmForgotPassword(
+            String identifier, String otp, String newPassword) {
+        Map<String, String> fieldErrors = new LinkedHashMap<>();
+        String needle = identifier == null ? "" : identifier.trim();
+        String code = otp == null ? "" : otp.trim();
+        String next = newPassword == null ? "" : newPassword.trim();
+
+        if (needle.isBlank()) {
+            fieldErrors.put("identifier", "Enter your username or email address.");
+        }
+        if (code.isBlank()) {
+            fieldErrors.put("otp", "Enter the 6-digit code from your email.");
+        } else if (!code.matches("\\d{6}")) {
+            fieldErrors.put("otp", "OTP must be a 6-digit code.");
+        }
+        int min = configService.getConfig().getPasswordMinLength();
+        if (next.isBlank()) {
+            fieldErrors.put("newPassword", "Enter a new password.");
+        } else if (next.length() < min) {
+            fieldErrors.put("newPassword",
+                    "New password must be at least " + min + " characters.");
+        }
+        if (!fieldErrors.isEmpty()) {
+            throw ApiException.badRequest(fieldErrors);
+        }
+
+        AppUser user = resolveUserByUsernameOrEmail(needle);
+        Credential credential = user == null
+                ? null
+                : credentialRepository.findByUserId(user.getId()).orElse(null);
+        if (user == null || credential == null) {
+            throw ApiException.unauthorized(Map.of(
+                    "identifier", "No account found with this username or email."));
+        }
+        if (credential.isDeactivated() || !user.isActive()) {
+            throw ApiException.unauthorized(Map.of(
+                    "identifier", "This account is inactive or deactivated."));
+        }
+        if (credential.getOtpCodeHash() == null || credential.getOtpExpiresAt() == null) {
+            throw ApiException.unprocessable(Map.of(
+                    "otp", "No OTP requested. Go back and request a new code."));
+        }
+        if (credential.getOtpExpiresAt().isBefore(Instant.now())) {
+            credential.setOtpCodeHash(null);
+            credential.setOtpExpiresAt(null);
+            credentialRepository.save(credential);
+            throw ApiException.unprocessable(Map.of(
+                    "otp", "The OTP has expired. Request a new one."));
+        }
+        if (!passwordEncoder.matches(code, credential.getOtpCodeHash())) {
+            throw ApiException.unauthorized(Map.of(
+                    "otp", "Incorrect OTP. Check the code sent to your registered email."));
+        }
+        if (passwordEncoder.matches(next, credential.getPasswordHash())) {
+            throw ApiException.unprocessable(Map.of(
+                    "newPassword", "New password must be different from the current password."));
+        }
+
+        credential.setPasswordHash(passwordEncoder.encode(next));
+        credential.setOneTime(false);
         credential.setOtpCodeHash(null);
         credential.setOtpExpiresAt(null);
+        credential.setLastChangedAt(Instant.now());
         credentialRepository.save(credential);
         refreshTokenService.revokeAllForUser(user.getId());
 
         auditService.record(
                 user.getId(),
                 user.getRole().name(),
-                "PASSWORD_RESET_REQUESTED",
+                "FORGOT_PASSWORD_COMPLETED",
                 AuditTargetType.CREDENTIAL,
                 credential.getId(),
-                "Forgot-password flow: one-time password emailed after email validation");
+                "Password reset via forgot-password email OTP");
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ok", true);
         body.put("message",
-                "A one-time password has been sent to " + user.getEmail()
-                        + ". It must be changed at your next login.");
-        if (properties.getMail().isDemoExposeSecrets()) {
-            body.put("demoOneTimePassword", oneTimePassword);
-        }
+                "Password updated successfully. You can sign in with your username or email and the new password.");
         return body;
+    }
+
+    private AppUser resolveUserByUsernameOrEmail(String identifier) {
+        return userRepository.findByUsernameIgnoreCase(identifier)
+                .or(() -> userRepository.findByEmailIgnoreCase(identifier))
+                .or(() -> credentialRepository.findByUsernameIgnoreCase(identifier)
+                        .flatMap(c -> userRepository.findById(c.getUserId())))
+                .orElse(null);
     }
 
     private Map<String, Object> issueAuthResponse(

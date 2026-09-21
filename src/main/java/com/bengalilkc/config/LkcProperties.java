@@ -52,7 +52,13 @@ public class LkcProperties {
 
     @Data
     public static class Mail {
+        /** SMTP username (often same as From address). */
+        private String username = "";
+        /** SMTP password / app password. */
+        private String password = "";
         private String from = "noreply@bengali-lkc.local";
+        /** Display name shown in the From field (e.g. No Reply). */
+        private String fromName = "Bengali LKC (No Reply)";
         private boolean demoExposeSecrets = true;
     }
 }

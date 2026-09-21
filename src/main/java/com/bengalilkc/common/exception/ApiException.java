@@ -30,6 +30,10 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.UNAUTHORIZED, message);
     }
 
+    public static ApiException unauthorized(Map<String, String> errors) {
+        return new ApiException(HttpStatus.UNAUTHORIZED, errors);
+    }
+
     public static ApiException forbidden(String message) {
         return new ApiException(HttpStatus.FORBIDDEN, message);
     }
@@ -60,5 +64,9 @@ public class ApiException extends RuntimeException {
 
     public static ApiException badRequest(String message) {
         return new ApiException(HttpStatus.BAD_REQUEST, message);
+    }
+
+    public static ApiException badRequest(Map<String, String> errors) {
+        return new ApiException(HttpStatus.BAD_REQUEST, errors);
     }
 }
