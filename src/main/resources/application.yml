@@ -120,6 +120,7 @@ lkc:
   bootstrap:
     seed-demo-users: ${SEED_DEMO_USERS:true}
     import-lexicon-xml: ${IMPORT_LEXICON_XML:false}
+    clear-core-lexicon-before-import: ${CLEAR_CORE_LEXICON_BEFORE_IMPORT:false}
     lexicon-xml-path: ${LEXICON_XML_PATH:Documents/Bangla Mono Lingual Lexicons.xml}
   mail:
     from: ${MAIL_FROM:}

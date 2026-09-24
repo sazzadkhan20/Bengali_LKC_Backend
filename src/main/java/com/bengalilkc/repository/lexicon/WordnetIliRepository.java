@@ -6,6 +6,7 @@ import java.util.List;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 public interface WordnetIliRepository extends JpaRepository<WordnetIli, String> {
 
@@ -14,5 +15,6 @@ public interface WordnetIliRepository extends JpaRepository<WordnetIli, String> 
         where lower(w.wordsCsv) like lower(concat('%', :word, '%'))
           and (:pos is null or w.pos = :pos)
         """)
-    List<WordnetIli> searchByWord(String word, PartOfSpeech pos, Pageable pageable);
+    List<WordnetIli> searchByWord(
+            @Param("word") String word, @Param("pos") PartOfSpeech pos, Pageable pageable);
 }
