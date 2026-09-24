@@ -47,6 +47,8 @@ public class LkcProperties {
     public static class Bootstrap {
         private boolean seedDemoUsers = true;
         private boolean importLexiconXml = false;
+        /** When true with import, wipe core lexicon tables first then reload from XML. */
+        private boolean clearCoreLexiconBeforeImport = false;
         private String lexiconXmlPath = "Documents/Bangla Mono Lingual Lexicons.xml";
     }
 

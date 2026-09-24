@@ -21,4 +21,6 @@ public interface LexicalEntryRepository extends JpaRepository<LexicalEntryEntity
     List<LexicalEntryEntity> findByPartOfSpeech(PartOfSpeech pos);
 
     long countByCrowdsourcedTrue();
+
+    boolean existsByWrittenFormAndPartOfSpeech(String writtenForm, PartOfSpeech pos);
 }

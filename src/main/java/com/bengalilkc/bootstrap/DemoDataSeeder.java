@@ -62,7 +62,8 @@ public class DemoDataSeeder implements ApplicationRunner {
             if (!path.isAbsolute()) {
                 path = Path.of(System.getProperty("user.dir")).resolve(path);
             }
-            var stats = lexiconImportService.importFromXml(path);
+            boolean force = properties.getBootstrap().isClearCoreLexiconBeforeImport();
+            var stats = lexiconImportService.importFromXml(path, force);
             log.info("Lexicon XML import finished: {}", stats);
         }
     }

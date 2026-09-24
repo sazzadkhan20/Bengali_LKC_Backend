@@ -36,7 +36,7 @@ public class SynsetEntity {
     @Column(name = "lexicon_id", nullable = false, length = 100)
     private String lexiconId;
 
-    @Column(nullable = false, length = 50, unique = true)
+    @Column(nullable = false, length = 50)
     private String ili;
 
     

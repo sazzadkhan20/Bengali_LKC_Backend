@@ -50,7 +50,9 @@ spring:
 lkc:
   bootstrap:
     seed-demo-users: true
-    import-lexicon-xml: false
+    # Corpus already loaded from Bangla Mono Lingual Lexicons.xml — skip wipe on restart
+    import-lexicon-xml: true
+    clear-core-lexicon-before-import: false
   mail:
     from: ${MAIL_FROM:benlkc2026@gmail.com}
     from-name: ${MAIL_FROM_NAME:Bengali LKC (No Reply)}

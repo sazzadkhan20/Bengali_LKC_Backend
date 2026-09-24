@@ -13,8 +13,8 @@ import com.bengalilkc.domain.enums.Permission;
 import com.bengalilkc.domain.enums.Role;
 import com.bengalilkc.domain.enums.SynsetAction;
 import com.bengalilkc.domain.entity.lexicon.SynsetEntity;
+import com.bengalilkc.repository.lexicon.SenseRepository;
 import com.bengalilkc.repository.lexicon.SynsetRepository;
-import com.bengalilkc.repository.lexicon.WordnetIliRepository;
 import com.bengalilkc.repository.workflow.StateTransitionRepository;
 import com.bengalilkc.repository.workflow.SubmissionRepository;
 import com.bengalilkc.security.PermissionMatrix;
@@ -23,6 +23,7 @@ import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.ConfigService;
 import com.bengalilkc.service.admin.IdGeneratorService;
 import com.bengalilkc.service.community.LeaderboardService;
+import com.bengalilkc.service.lexicon.LexiconValidationService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Instant;
@@ -31,6 +32,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
@@ -42,10 +44,14 @@ public class SubmissionService {
     private static final Pattern BENGALI = Pattern.compile("[\\u0980-\\u09ff]");
     private static final Pattern ILI = Pattern.compile("^\\d{8}-[nvar]$");
 
+    private static final Set<String> SENSE_REL_TYPES = Set.of("derivation", "antonym", "metonym");
+    private static final Set<String> SYNSET_REL_TYPES =
+            Set.of("hypernym", "mero_part", "mero_substance", "mero_member", "attribute");
+
     private final SubmissionRepository submissionRepository;
     private final StateTransitionRepository transitionRepository;
     private final SynsetRepository synsetRepository;
-    private final WordnetIliRepository wordnetIliRepository;
+    private final SenseRepository senseRepository;
     private final IdGeneratorService idGeneratorService;
     private final AuditService auditService;
     private final ConfigService configService;
@@ -57,7 +63,7 @@ public class SubmissionService {
             SubmissionRepository submissionRepository,
             StateTransitionRepository transitionRepository,
             SynsetRepository synsetRepository,
-            WordnetIliRepository wordnetIliRepository,
+            SenseRepository senseRepository,
             IdGeneratorService idGeneratorService,
             AuditService auditService,
             ConfigService configService,
@@ -67,7 +73,7 @@ public class SubmissionService {
         this.submissionRepository = submissionRepository;
         this.transitionRepository = transitionRepository;
         this.synsetRepository = synsetRepository;
-        this.wordnetIliRepository = wordnetIliRepository;
+        this.senseRepository = senseRepository;
         this.idGeneratorService = idGeneratorService;
         this.auditService = auditService;
         this.configService = configService;
@@ -92,10 +98,13 @@ public class SubmissionService {
             throw ApiException.forbidden("Your role cannot submit lexical entries.");
         }
         var config = configService.getConfig();
-        boolean isModerator = principal.getRole() == Role.SYSTEM_MODERATOR;
+        boolean isModerator = principal.getRole() == Role.SYSTEM_MODERATOR
+                || principal.getRole() == Role.PLATFORM_ARCHITECT;
         boolean saveAsDraft = bool(p.get("saveAsDraft"));
         Map<String, String> errors = new LinkedHashMap<>();
 
+        // Anti-bot: too-fast submissions are accepted but held UNDER_REVIEW (SRS §4.3 / §6.2).
+        boolean holdUnderReview = false;
         if (!isModerator) {
             if (config.isHoneypotEnabled() && str(p.get("honeypot")).length() > 0) {
                 Map<String, Object> silent = new LinkedHashMap<>();
@@ -105,9 +114,7 @@ public class SubmissionService {
             }
             Number elapsed = p.get("elapsedSeconds") instanceof Number n ? n : 0;
             if (elapsed.intValue() < config.getMinSubmissionSeconds() && !saveAsDraft) {
-                errors.put("timing",
-                        "Submission completed too quickly (minimum " + config.getMinSubmissionSeconds()
-                                + "s). It would be placed UNDER_REVIEW.");
+                holdUnderReview = true;
             }
             if (config.isCaptchaEnabled() && !bool(p.get("captchaPassed")) && !saveAsDraft) {
                 errors.put("captcha", "Please complete the CAPTCHA verification.");
@@ -155,22 +162,28 @@ public class SubmissionService {
                 errors.put("synsetId",
                         "POS mismatch: selected synset is \"" + syn.getPartOfSpeech().getCode()
                                 + "\" but the lemma is \"" + pos.getCode() + "\".");
+            } else if (pos != null && !word.isEmpty()
+                    && senseRepository.existsByLemmaPosAndSynset(word, pos, syn.getId())) {
+                errors.put("duplicate",
+                        "Exact duplicate: \"" + word + "\" (" + pos.getCode()
+                                + ") is already linked to synset " + syn.getId() + " in the lexicon.");
             }
         } else if (action == SynsetAction.CREATE) {
-            iliCode = str(p.get("iliCode")).trim();
-            if (!ILI.matcher(iliCode).matches()) {
+            iliCode = LexiconValidationService.normalizeIli(str(p.get("iliCode")));
+            if (LexiconValidationService.isNa(iliCode) || "n/a".equals(iliCode)) {
+                iliCode = "n/a";
+            } else if (!ILI.matcher(iliCode).matches()) {
                 errors.put("iliCode",
-                        "ILI code must follow the format {8-digit-offset}-{n|v|a|r}, e.g. 04192858-n.");
+                        "ILI code must follow the format {8-digit-offset}-{n|v|a|r}, e.g. 04192858-n — or select N/A.");
             } else if (pos != null && !iliCode.endsWith(pos.getCode())) {
                 errors.put("iliCode", "ILI code POS suffix must match the selected part of speech.");
-            } else if (wordnetIliRepository.count() > 0 && !wordnetIliRepository.existsById(iliCode)) {
-                errors.put("iliCode",
-                        "This ILI code is not in the Princeton WordNet 2.1 registry. Use the ILI Finder to look up the correct code.");
             } else if (synsetRepository.existsByIli(iliCode)) {
                 errors.put("iliCode",
                         "This ILI code already has a Bengali synset — use “Link to existing synset” instead.");
             }
         }
+
+        validateRelations(p, errors);
 
         String definitionText = blankToNull(str(p.get("definitionText")).trim());
         DefinitionLanguage defLang = null;
@@ -212,20 +225,21 @@ public class SubmissionService {
                             ? null
                             : synsetRepository.findById(existing.getSynsetId()).map(SynsetEntity::getIli).orElse(null))
                     : existing.getIliCode();
-            if (targetIli != null && targetIli.equals(existingIli)) {
+            if (sameConcept(targetIli, existingIli, synsetId, existing.getSynsetId())) {
                 throw ApiException.conflict(Map.of(
                         "duplicate",
                         "Exact duplicate blocked: \"" + word + "\" (" + pos.getCode()
-                                + ") is already linked to ILI " + targetIli + " (submission " + existing.getId() + ")."));
+                                + ") is already linked to the same concept (submission " + existing.getId() + ")."));
             }
         }
+        boolean lexiconNear = senseRepository.existsByLemmaAndPos(word, pos);
         List<Submission> near = submissionRepository.findActiveByLemmaAndPos(word, pos);
-        if (!near.isEmpty() && !bool(p.get("confirmNearDuplicate"))) {
-            Submission n = near.get(0);
+        if ((lexiconNear || !near.isEmpty()) && !bool(p.get("confirmNearDuplicate"))) {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("nearDuplicate",
-                    "\"" + word + "\" (" + pos.getCode() + ") already exists with a different concept (submission "
-                            + n.getId() + "). Confirm to proceed — this may be legitimate polysemy.");
+                    "\"" + word + "\" (" + pos.getCode()
+                            + ") already exists with a different concept in the lexicon or an open submission. "
+                            + "Confirm to proceed — this may be legitimate polysemy.");
             throw new NearDuplicateException(body);
         }
 
@@ -254,14 +268,26 @@ public class SubmissionService {
                 "\"" + word + "\" (" + pos.getCode() + ")");
 
         if (!saveAsDraft) {
-            transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
-            if (directApprove) {
+            if (holdUnderReview) {
+                // Bypass normal LE/CLE queue until a System Moderator clears the anti-bot hold.
+                transition(
+                        sub,
+                        EntryState.UNDER_REVIEW,
+                        principal.getId(),
+                        principal.getRole().name(),
+                        "Auto-held: form completed faster than minimum "
+                                + config.getMinSubmissionSeconds()
+                                + "s (anti-bot).");
+            } else if (directApprove) {
+                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
                 transition(sub, EntryState.VALIDATED, principal.getId(), principal.getRole().name(),
                         "Direct approval: " + justification);
                 sub.setValidatedBy(principal.getId());
                 sub.setValidatedAt(Instant.now());
                 sub.setRewardEligible(false);
                 submissionRepository.save(sub);
+            } else {
+                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
             }
         }
 
@@ -269,6 +295,11 @@ public class SubmissionService {
         body.put("ok", true);
         body.put("id", sub.getId());
         body.put("state", sub.getState().name());
+        if (holdUnderReview) {
+            body.put(
+                    "message",
+                    "Submitted but held UNDER_REVIEW for anti-bot checks. A System Moderator will clear it.");
+        }
         return body;
     }
 
@@ -492,6 +523,57 @@ public class SubmissionService {
         sub.setValidatedBy(actorId);
         sub.setValidatedAt(Instant.now());
         submissionRepository.save(sub);
+    }
+
+    private void validateRelations(Map<String, Object> p, Map<String, String> errors) {
+        List<SenseRelationPayload> senseRels = readSense(writeJson(p.get("senseRelations")));
+        int i = 0;
+        for (SenseRelationPayload rel : senseRels) {
+            i++;
+            if (rel == null || rel.relType() == null || rel.target() == null) {
+                continue;
+            }
+            if (!SENSE_REL_TYPES.contains(rel.relType())) {
+                errors.put("senseRelations", "Invalid sense relation type: " + rel.relType());
+                break;
+            }
+            if (!senseRepository.existsById(rel.target().trim())) {
+                errors.put("senseRelations",
+                        "Sense relation #" + i + " target was not found. Search and pick an existing word sense.");
+                break;
+            }
+        }
+        List<SynsetRelationPayload> synRels = readSynset(writeJson(p.get("synsetRelations")));
+        i = 0;
+        for (SynsetRelationPayload rel : synRels) {
+            i++;
+            if (rel == null || rel.relType() == null || rel.target() == null) {
+                continue;
+            }
+            if (!SYNSET_REL_TYPES.contains(rel.relType())) {
+                errors.put("synsetRelations", "Invalid synset relation type: " + rel.relType());
+                break;
+            }
+            if (!synsetRepository.existsById(rel.target().trim())) {
+                errors.put("synsetRelations",
+                        "Synset relation #" + i + " target was not found. Search and pick an existing concept.");
+                break;
+            }
+        }
+    }
+
+    private static boolean sameConcept(
+            String iliA, String iliB, String synsetIdA, String synsetIdB) {
+        if (synsetIdA != null && synsetIdA.equals(synsetIdB)) {
+            return true;
+        }
+        if (iliA == null || iliB == null) {
+            return false;
+        }
+        if (LexiconValidationService.isNa(iliA) || LexiconValidationService.isNa(iliB)) {
+            return false;
+        }
+        return iliA.equalsIgnoreCase(iliB);
     }
 
     private static void requirePerm(Role role, Permission permission) {
