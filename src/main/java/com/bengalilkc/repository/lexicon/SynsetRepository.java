@@ -19,6 +19,9 @@ public interface SynsetRepository extends JpaRepository<SynsetEntity, String> {
             """)
     boolean existsByIli(String ili);
 
+    @Query("select s.ili from SynsetEntity s where s.ili in :ilis")
+    List<String> findExistingIlis(@Param("ilis") java.util.Collection<String> ilis);
+
     List<SynsetEntity> findByIdStartingWith(String prefix, Pageable pageable);
 
     @Query("""

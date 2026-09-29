@@ -3,19 +3,9 @@ package com.bengalilkc.bootstrap;
 import com.bengalilkc.config.LkcProperties;
 import com.bengalilkc.domain.entity.identity.AppUser;
 import com.bengalilkc.domain.entity.identity.Credential;
-import com.bengalilkc.domain.entity.lexicon.LexicalEntryEntity;
-import com.bengalilkc.domain.entity.lexicon.SenseEntity;
-import com.bengalilkc.domain.entity.lexicon.SynsetEntity;
-import com.bengalilkc.domain.entity.lexicon.WordnetIli;
-import com.bengalilkc.domain.enums.DefinitionLanguage;
-import com.bengalilkc.domain.enums.PartOfSpeech;
 import com.bengalilkc.domain.enums.Role;
 import com.bengalilkc.repository.identity.AppUserRepository;
 import com.bengalilkc.repository.identity.CredentialRepository;
-import com.bengalilkc.repository.lexicon.LexicalEntryRepository;
-import com.bengalilkc.repository.lexicon.SenseRepository;
-import com.bengalilkc.repository.lexicon.SynsetRepository;
-import com.bengalilkc.repository.lexicon.WordnetIliRepository;
 import com.bengalilkc.service.lexicon.LexiconImportService;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -29,6 +19,10 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+/**
+ * Seeds only the initial login accounts and the XML lexicon corpus.
+ * Lexicon and workflow tables must never receive placeholder rows.
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -39,10 +33,6 @@ public class DemoDataSeeder implements ApplicationRunner {
     private final CredentialRepository credentialRepository;
     private final PasswordEncoder passwordEncoder;
     private final LexiconImportService lexiconImportService;
-    private final LexicalEntryRepository entryRepository;
-    private final SynsetRepository synsetRepository;
-    private final SenseRepository senseRepository;
-    private final WordnetIliRepository wordnetIliRepository;
 
     @Override
     @Transactional
@@ -50,12 +40,6 @@ public class DemoDataSeeder implements ApplicationRunner {
         if (properties.getBootstrap().isSeedDemoUsers() && userRepository.count() == 0) {
             seedUsers();
             log.info("Demo users and credentials seeded");
-        }
-        if (properties.getBootstrap().isSeedDemoUsers()
-                && entryRepository.count() == 0
-                && !properties.getBootstrap().isImportLexiconXml()) {
-            seedSampleLexicon();
-            log.info("Sample lexicon rows seeded (enable IMPORT_LEXICON_XML for full corpus)");
         }
         if (properties.getBootstrap().isImportLexiconXml()) {
             Path path = Path.of(properties.getBootstrap().getLexiconXmlPath());
@@ -65,51 +49,6 @@ public class DemoDataSeeder implements ApplicationRunner {
             boolean force = properties.getBootstrap().isClearCoreLexiconBeforeImport();
             var stats = lexiconImportService.importFromXml(path, force);
             log.info("Lexicon XML import finished: {}", stats);
-        }
-    }
-
-    private void seedSampleLexicon() {
-        SynsetEntity syn = SynsetEntity.builder()
-                .id("ben-syn1")
-                .lexiconId("livelanguage-ben")
-                .ili("00017222-n")
-                .partOfSpeech(PartOfSpeech.N)
-                .lexicalized(true)
-                .definitionLanguage(DefinitionLanguage.BEN)
-                .definitionText("পঠনযোগ্য মুদ্রিত বা লিখিত বিষয়সম্বলিত বস্তু")
-                .crowdsourced(false)
-                .build();
-        synsetRepository.save(syn);
-
-        LexicalEntryEntity entry = LexicalEntryEntity.builder()
-                .id("ben-word-n1")
-                .lexiconId("livelanguage-ben")
-                .writtenForm("বই")
-                .partOfSpeech(PartOfSpeech.N)
-                .crowdsourced(false)
-                .build();
-        entryRepository.save(entry);
-
-        SenseEntity sense = SenseEntity.builder()
-                .id("ben-sen1")
-                .lexicalEntry(entry)
-                .synset(syn)
-                .build();
-        senseRepository.save(sense);
-
-        if (wordnetIliRepository.count() == 0) {
-            wordnetIliRepository.save(WordnetIli.builder()
-                    .ili("00017222-n")
-                    .pos(PartOfSpeech.N)
-                    .wordsCsv("book,volume")
-                    .gloss("a written work or composition that has been published")
-                    .build());
-            wordnetIliRepository.save(WordnetIli.builder()
-                    .ili("01234567-n")
-                    .pos(PartOfSpeech.N)
-                    .wordsCsv("demo,sample")
-                    .gloss("demo ILI unused in Bengali lexicon yet")
-                    .build());
         }
     }
 

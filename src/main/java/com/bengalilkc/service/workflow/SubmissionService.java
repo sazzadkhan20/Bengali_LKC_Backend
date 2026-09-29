@@ -83,8 +83,21 @@ public class SubmissionService {
     }
 
     @Transactional(readOnly = true)
-    public List<Map<String, Object>> list() {
-        return submissionRepository.findAllByOrderByUpdatedAtDesc().stream().map(this::toDto).toList();
+    public List<Map<String, Object>> listByState(EntryState state) {
+        return toDtos(submissionRepository.findByStateOrderByUpdatedAtDesc(state));
+    }
+
+    /** DTOs for many submissions with all histories loaded in one query. */
+    public List<Map<String, Object>> toDtos(List<Submission> subs) {
+        if (subs.isEmpty()) {
+            return List.of();
+        }
+        Map<String, List<StateTransition>> history = new java.util.HashMap<>();
+        for (StateTransition t : transitionRepository.findBySubmissionIdInOrderByCreatedAtAsc(
+                subs.stream().map(Submission::getId).toList())) {
+            history.computeIfAbsent(t.getSubmissionId(), k -> new ArrayList<>()).add(t);
+        }
+        return subs.stream().map(s -> toDto(s, history.getOrDefault(s.getId(), List.of()))).toList();
     }
 
     @Transactional(readOnly = true)
@@ -183,7 +196,7 @@ public class SubmissionService {
             }
         }
 
-        validateRelations(p, errors);
+        validateRelations(p, errors, action == SynsetAction.LINK ? synsetId : null);
 
         String definitionText = blankToNull(str(p.get("definitionText")).trim());
         DefinitionLanguage defLang = null;
@@ -205,7 +218,8 @@ public class SubmissionService {
             errors.put("reviewerNote", "Note must be at most 500 characters.");
         }
 
-        boolean directApprove = isModerator && bool(p.get("directApprove"));
+        boolean directApprove = bool(p.get("directApprove"))
+                && PermissionMatrix.has(principal.getRole(), Permission.DIRECT_APPROVAL);
         String justification = str(p.get("directApproveJustification")).trim();
         if (directApprove && justification.length() < 20) {
             errors.put("directApproveJustification",
@@ -261,6 +275,7 @@ public class SubmissionService {
                 .reviewerNote(reviewerNote)
                 .createdAt(now)
                 .updatedAt(now)
+                .lastUpdatedBy(principal.getId())
                 .build();
         submissionRepository.save(sub);
         recordTransition(sub, null, EntryState.DRAFT, principal.getId(), principal.getRole().name(), null);
@@ -436,6 +451,8 @@ public class SubmissionService {
                 requirePerm(role, Permission.ASSIGN_ENTRIES);
                 String assignTo = blankToNull(str(p.get("assignTo")));
                 sub.setAssignedTo(assignTo);
+                sub.setLastUpdatedBy(principal.getId());
+                sub.setUpdatedAt(Instant.now());
                 submissionRepository.save(sub);
                 auditService.record(principal, "ENTRY_ASSIGNED", AuditTargetType.SUBMISSION, sub.getId(),
                         "Assigned to " + (assignTo != null ? assignTo : "(unassigned)"));
@@ -453,6 +470,7 @@ public class SubmissionService {
                 "\"" + sub.getWrittenForm() + "\"" + (comment != null ? " — " + comment.substring(0, Math.min(80, comment.length())) : ""));
         sub.setState(to);
         sub.setUpdatedAt(Instant.now());
+        sub.setLastUpdatedBy(actorId);
         submissionRepository.save(sub);
         if (to == EntryState.VALIDATED && "CHIEF_LEXICAL_EDITOR".equals(actorRole)) {
             leaderboardService.announceValidationMilestones(sub);
@@ -475,12 +493,17 @@ public class SubmissionService {
     }
 
     public Map<String, Object> toDto(Submission s) {
+        return toDto(s, transitionRepository.findBySubmissionIdOrderByCreatedAtAsc(s.getId()));
+    }
+
+    private Map<String, Object> toDto(Submission s, List<StateTransition> transitions) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", s.getId());
         m.put("state", s.getState().name());
         m.put("contributorId", s.getContributorId());
         m.put("createdAt", s.getCreatedAt() != null ? s.getCreatedAt().toString() : null);
         m.put("updatedAt", s.getUpdatedAt() != null ? s.getUpdatedAt().toString() : null);
+        m.put("lastUpdatedBy", s.getLastUpdatedBy());
         m.put("assignedTo", s.getAssignedTo());
         m.put("writtenForm", s.getWrittenForm());
         m.put("pos", s.getPartOfSpeech() != null ? s.getPartOfSpeech().getCode() : null);
@@ -498,7 +521,7 @@ public class SubmissionService {
         m.put("validatedBy", s.getValidatedBy());
         m.put("validatedAt", s.getValidatedAt() != null ? s.getValidatedAt().toString() : null);
         List<Map<String, Object>> history = new ArrayList<>();
-        for (StateTransition t : transitionRepository.findBySubmissionIdOrderByCreatedAtAsc(s.getId())) {
+        for (StateTransition t : transitions) {
             Map<String, Object> h = new LinkedHashMap<>();
             h.put("from", t.getFromState() != null ? t.getFromState().name() : null);
             h.put("to", t.getToState().name());
@@ -525,36 +548,62 @@ public class SubmissionService {
         submissionRepository.save(sub);
     }
 
-    private void validateRelations(Map<String, Object> p, Map<String, String> errors) {
+    private void validateRelations(Map<String, Object> p, Map<String, String> errors, String linkedSynsetId) {
         List<SenseRelationPayload> senseRels = readSense(writeJson(p.get("senseRelations")));
-        int i = 0;
-        for (SenseRelationPayload rel : senseRels) {
-            i++;
-            if (rel == null || rel.relType() == null || rel.target() == null) {
-                continue;
-            }
-            if (!SENSE_REL_TYPES.contains(rel.relType())) {
-                errors.put("senseRelations", "Invalid sense relation type: " + rel.relType());
-                break;
-            }
-            if (!senseRepository.existsById(rel.target().trim())) {
-                errors.put("senseRelations",
-                        "Sense relation #" + i + " target was not found. Search and pick an existing word sense.");
-                break;
+        if (senseRels.size() > 20) {
+            errors.put("senseRelations", "At most 20 sense relations are allowed per entry.");
+        } else {
+            Set<String> seen = new java.util.HashSet<>();
+            int i = 0;
+            for (SenseRelationPayload rel : senseRels) {
+                i++;
+                if (rel == null || rel.relType() == null || rel.target() == null || rel.target().isBlank()) {
+                    continue;
+                }
+                String target = rel.target().trim();
+                if (!SENSE_REL_TYPES.contains(rel.relType())) {
+                    errors.put("senseRelations", "Invalid sense relation type: " + rel.relType());
+                    break;
+                }
+                if (!seen.add(rel.relType() + "|" + target)) {
+                    errors.put("senseRelations", "Sense relation #" + i + " is a duplicate of an earlier row.");
+                    break;
+                }
+                if (!senseRepository.existsById(target)) {
+                    errors.put("senseRelations",
+                            "Sense relation #" + i + " target was not found. Search and pick an existing word sense.");
+                    break;
+                }
             }
         }
+
         List<SynsetRelationPayload> synRels = readSynset(writeJson(p.get("synsetRelations")));
-        i = 0;
+        if (synRels.size() > 20) {
+            errors.put("synsetRelations", "At most 20 synset relations are allowed per entry.");
+            return;
+        }
+        Set<String> seen = new java.util.HashSet<>();
+        int i = 0;
         for (SynsetRelationPayload rel : synRels) {
             i++;
-            if (rel == null || rel.relType() == null || rel.target() == null) {
+            if (rel == null || rel.relType() == null || rel.target() == null || rel.target().isBlank()) {
                 continue;
             }
+            String target = rel.target().trim();
             if (!SYNSET_REL_TYPES.contains(rel.relType())) {
                 errors.put("synsetRelations", "Invalid synset relation type: " + rel.relType());
                 break;
             }
-            if (!synsetRepository.existsById(rel.target().trim())) {
+            if (target.equals(linkedSynsetId)) {
+                errors.put("synsetRelations",
+                        "Synset relation #" + i + " points to the same synset this word is linked to.");
+                break;
+            }
+            if (!seen.add(rel.relType() + "|" + target)) {
+                errors.put("synsetRelations", "Synset relation #" + i + " is a duplicate of an earlier row.");
+                break;
+            }
+            if (!synsetRepository.existsById(target)) {
                 errors.put("synsetRelations",
                         "Synset relation #" + i + " target was not found. Search and pick an existing concept.");
                 break;

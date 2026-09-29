@@ -12,6 +12,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 import java.time.Instant;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -96,6 +97,14 @@ public class Submission {
 
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
+
+    @Column(name = "last_updated_by", length = 64)
+    private String lastUpdatedBy;
+
+    /** Two reviewers acting on the same entry at once: the second write fails instead of overwriting. */
+    @Version
+    @Column(nullable = false)
+    private Long version;
 
     @PrePersist
     void prePersist() {

@@ -4,6 +4,7 @@ import com.bengalilkc.common.exception.ApiException;
 import com.bengalilkc.service.workflow.SubmissionService;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
@@ -14,12 +15,23 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+@Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
     @ExceptionHandler(SubmissionService.NearDuplicateException.class)
     public ResponseEntity<Map<String, Object>> handleNearDuplicate(SubmissionService.NearDuplicateException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(ex.getBody());
+    }
+
+    @ExceptionHandler({
+        org.springframework.orm.ObjectOptimisticLockingFailureException.class,
+        jakarta.persistence.OptimisticLockException.class
+    })
+    public ResponseEntity<Map<String, Object>> handleOptimisticLock(Exception ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(Map.of("error",
+                        "This entry was just updated by someone else. Refresh and try again."));
     }
 
     @ExceptionHandler(ApiException.class)
@@ -63,6 +75,7 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
+        log.error("Unhandled exception", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(Map.of("error", "Internal server error."));
     }
