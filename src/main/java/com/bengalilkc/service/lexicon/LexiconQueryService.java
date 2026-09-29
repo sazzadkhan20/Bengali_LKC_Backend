@@ -35,14 +35,30 @@ public class LexiconQueryService {
     private final SynsetRelationRepository synsetRelationRepository;
     private final WordnetIliRepository wordnetIliRepository;
 
+    /** count(*) scans the whole table in PostgreSQL, so corpus sizes are cached briefly. */
+    private static final long COUNTS_TTL_MS = 60_000;
+
+    private volatile Map<String, Long> cachedCounts;
+    private volatile long cachedCountsAt;
+
+    private Map<String, Long> corpusCounts() {
+        Map<String, Long> c = cachedCounts;
+        if (c != null && System.currentTimeMillis() - cachedCountsAt < COUNTS_TTL_MS) {
+            return c;
+        }
+        Map<String, Long> fresh = new LinkedHashMap<>();
+        fresh.put("entries", entryRepository.count());
+        fresh.put("synsets", synsetRepository.count());
+        fresh.put("senses", senseRepository.count());
+        fresh.put("iliRegistry", wordnetIliRepository.count());
+        cachedCounts = fresh;
+        cachedCountsAt = System.currentTimeMillis();
+        return fresh;
+    }
+
     @Transactional(readOnly = true)
     public Map<String, Object> publicStats() {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("entries", entryRepository.count());
-        m.put("synsets", synsetRepository.count());
-        m.put("senses", senseRepository.count());
-        m.put("iliRegistry", wordnetIliRepository.count());
-        return m;
+        return new LinkedHashMap<>(corpusCounts());
     }
 
     /** Sense-relation target search — by Bengali word (returns sense ids). */
@@ -77,68 +93,68 @@ public class LexiconQueryService {
         }
         String query = q.trim();
         PartOfSpeech pos = parsePos(posParam);
-        List<Map<String, Object>> results = new ArrayList<>();
-        Set<String> seen = new LinkedHashSet<>();
+        Map<String, SynsetEntity> found = new LinkedHashMap<>();
 
         if (query.toLowerCase().matches("^ben-syn\\d*$")) {
             for (SynsetEntity syn :
-                    synsetRepository.findByIdStartingWith(query.toLowerCase(), PageRequest.of(0, LOOKUP_LIMIT))) {
-                if (pos != null && syn.getPartOfSpeech() != pos) {
-                    continue;
+                    synsetRepository.findByIdStartingWith(query.toLowerCase(), PageRequest.of(0, LOOKUP_LIMIT * 2))) {
+                if (pos == null || syn.getPartOfSpeech() == pos) {
+                    found.putIfAbsent(syn.getId(), syn);
                 }
-                if (seen.add(syn.getId())) {
-                    results.add(synsetRow(syn));
+                if (found.size() >= LOOKUP_LIMIT) {
+                    break;
                 }
             }
-            return Map.of("results", results);
+            return Map.of("results", synsetRows(found.values()));
         }
 
         for (SenseEntity s : senseRepository.findForWordLookup(query, pos, PageRequest.of(0, LOOKUP_LIMIT * 2))) {
-            SynsetEntity syn = s.getSynset();
-            if (seen.add(syn.getId())) {
-                results.add(synsetRow(syn));
-            }
-            if (results.size() >= LOOKUP_LIMIT) {
-                return Map.of("results", results);
+            found.putIfAbsent(s.getSynset().getId(), s.getSynset());
+            if (found.size() >= LOOKUP_LIMIT) {
+                break;
             }
         }
 
-        if (results.size() < LOOKUP_LIMIT) {
-            int need = LOOKUP_LIMIT - results.size();
+        if (found.size() < LOOKUP_LIMIT) {
+            int need = LOOKUP_LIMIT - found.size();
             for (SynsetEntity syn :
                     synsetRepository.searchByDefinition(query, pos, PageRequest.of(0, need + 5))) {
-                if (seen.add(syn.getId())) {
-                    results.add(synsetRow(syn));
-                }
-                if (results.size() >= LOOKUP_LIMIT) {
+                found.putIfAbsent(syn.getId(), syn);
+                if (found.size() >= LOOKUP_LIMIT) {
                     break;
                 }
             }
         }
-        return Map.of("results", results);
+        return Map.of("results", synsetRows(found.values()));
     }
 
     @Transactional(readOnly = true)
     public Map<String, Object> lookupIli(String word, String posParam) {
         PartOfSpeech pos = parsePos(posParam);
+        Map<String, Long> counts = corpusCounts();
         Map<String, Object> registry = new LinkedHashMap<>();
-        registry.put("count", wordnetIliRepository.count());
-        registry.put("synsetCount", wordnetIliRepository.count());
-        registry.put("lemmaCount", entryRepository.count());
+        registry.put("count", counts.get("iliRegistry"));
+        registry.put("synsetCount", counts.get("iliRegistry"));
+        registry.put("lemmaCount", counts.get("entries"));
         registry.put("version", "Bengali-UKC-seeded");
         registry.put("source", "wordnet_ili");
 
         if (word == null || word.trim().length() < 2) {
             return Map.of("results", List.of(), "registry", registry);
         }
+        List<WordnetIli> hits = wordnetIliRepository.searchByWord(word.trim(), pos, PageRequest.of(0, 25));
+        Set<String> mappedIlis = hits.isEmpty()
+                ? Set.of()
+                : new java.util.HashSet<>(synsetRepository.findExistingIlis(
+                        hits.stream().map(WordnetIli::getIli).toList()));
         List<Map<String, Object>> results = new ArrayList<>();
-        for (WordnetIli w : wordnetIliRepository.searchByWord(word.trim(), pos, PageRequest.of(0, 25))) {
+        for (WordnetIli w : hits) {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("ili", w.getIli());
             row.put("pos", w.getPos().getCode());
             row.put("words", w.getWordsCsv() != null ? List.of(w.getWordsCsv().split(",")) : List.of());
             row.put("gloss", w.getGloss());
-            boolean mapped = synsetRepository.existsByIli(w.getIli());
+            boolean mapped = mappedIlis.contains(w.getIli());
             row.put("alreadyMapped", mapped);
             row.put("alreadyInBengali", mapped);
             results.add(row);
@@ -211,18 +227,33 @@ public class LexiconQueryService {
     }
 
     private Map<String, Object> synsetRow(SynsetEntity syn) {
-        Map<String, Object> row = new LinkedHashMap<>();
-        row.put("id", syn.getId());
-        row.put("ili", syn.getIli());
-        row.put("pos", syn.getPartOfSpeech().getCode());
-        row.put("definition", truncate(syn.getDefinitionText(), 110));
-        List<String> words = senseRepository.findBySynsetId(syn.getId()).stream()
-                .map(s -> s.getLexicalEntry().getWrittenForm())
-                .distinct()
-                .limit(5)
-                .toList();
-        row.put("words", words);
-        return row;
+        return synsetRows(List.of(syn)).get(0);
+    }
+
+    /** Builds result rows with member words fetched in a single query for all synsets. */
+    private List<Map<String, Object>> synsetRows(java.util.Collection<SynsetEntity> synsets) {
+        if (synsets.isEmpty()) {
+            return List.of();
+        }
+        Map<String, Set<String>> wordsBySynset = new java.util.HashMap<>();
+        for (Object[] r : senseRepository.findLemmasBySynsetIds(
+                synsets.stream().map(SynsetEntity::getId).toList())) {
+            Set<String> w = wordsBySynset.computeIfAbsent((String) r[0], k -> new LinkedHashSet<>());
+            if (w.size() < 5) {
+                w.add((String) r[1]);
+            }
+        }
+        List<Map<String, Object>> rows = new ArrayList<>(synsets.size());
+        for (SynsetEntity syn : synsets) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", syn.getId());
+            row.put("ili", syn.getIli());
+            row.put("pos", syn.getPartOfSpeech().getCode());
+            row.put("definition", truncate(syn.getDefinitionText(), 110));
+            row.put("words", List.copyOf(wordsBySynset.getOrDefault(syn.getId(), Set.of())));
+            rows.add(row);
+        }
+        return rows;
     }
 
     private Map<String, Object> entrySummary(LexicalEntryEntity e) {

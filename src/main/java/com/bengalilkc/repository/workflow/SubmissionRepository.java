@@ -20,7 +20,7 @@ public interface SubmissionRepository extends JpaRepository<Submission, String> 
         """)
     List<Submission> findActiveByLemmaAndPos(String writtenForm, PartOfSpeech pos);
 
-    List<Submission> findAllByOrderByUpdatedAtDesc();
+    List<Submission> findByStateOrderByUpdatedAtDesc(EntryState state);
     long countByState(EntryState state);
     long countByContributorIdAndState(String contributorId, EntryState state);
 }

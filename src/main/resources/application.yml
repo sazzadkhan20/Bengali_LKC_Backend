@@ -31,6 +31,11 @@ spring:
         order_inserts: true
         order_updates: true
         jdbc.batch_size: 50
+        # Lazy associations load in batches of 100 ids instead of one query per row (avoids N+1)
+        default_batch_fetch_size: 100
+        query:
+          in_clause_parameter_padding: true
+          plan_cache_max_size: 2048
     show-sql: false
 
   flyway:

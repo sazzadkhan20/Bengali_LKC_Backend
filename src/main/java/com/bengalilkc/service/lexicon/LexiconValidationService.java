@@ -92,19 +92,25 @@ public class LexiconValidationService {
 
         String nearDuplicate = null;
         if (errors.isEmpty() && pos != null && !word.isEmpty()) {
-            boolean lexiconNear = senseRepository.existsByLemmaAndPos(word, pos);
-            boolean submissionNear = !submissionRepository.findActiveByLemmaAndPos(word, pos).isEmpty();
+            List<SenseEntity> existingSenses = senseRepository.findByLemmaAndPos(word, pos);
+            var openSubs = submissionRepository.findActiveByLemmaAndPos(word, pos);
+            boolean lexiconNear = !existingSenses.isEmpty();
+            boolean submissionNear = !openSubs.isEmpty();
             if ((lexiconNear || submissionNear) && action == SynsetAction.LINK && synsetId != null) {
                 // Exact lexicon dup already handled; near = other synsets / submissions
-                List<SenseEntity> existing = senseRepository.findByLemmaAndPos(word, pos);
-                boolean onlyExact = existing.size() == 1 && existing.get(0).getSynset().getId().equals(synsetId);
+                boolean onlyExact = !submissionNear
+                        && existingSenses.size() == 1
+                        && existingSenses.get(0).getSynset().getId().equals(synsetId);
                 if (!onlyExact && !confirmNear) {
                     nearDuplicate = "\"" + word + "\" (" + pos.getCode()
                             + ") already exists with another concept. Confirm to proceed — this may be legitimate polysemy.";
                 }
             } else if ((lexiconNear || submissionNear) && action == SynsetAction.CREATE && !confirmNear) {
                 // Creating new sense for existing lemma+POS is always near-dup unless confirmed
-                if (!(iliCode != null && !isNa(iliCode) && senseLinkedToIli(word, pos, iliCode))) {
+                final String ili = iliCode;
+                boolean sameIliAlready = ili != null && !isNa(ili)
+                        && existingSenses.stream().anyMatch(s -> ili.equalsIgnoreCase(s.getSynset().getIli()));
+                if (!sameIliAlready) {
                     nearDuplicate = "\"" + word + "\" (" + pos.getCode()
                             + ") already exists in the lexicon or an open submission. Confirm to proceed — this may be legitimate polysemy.";
                 }
@@ -114,12 +120,19 @@ public class LexiconValidationService {
             String targetIli = action == SynsetAction.LINK
                     ? synsetRepository.findById(synsetId).map(SynsetEntity::getIli).orElse(null)
                     : iliCode;
+            Map<String, String> iliBySynset = new java.util.HashMap<>();
+            List<String> linkedIds = openSubs.stream()
+                    .filter(s -> s.getSynsetAction() == SynsetAction.LINK && s.getSynsetId() != null)
+                    .map(s -> s.getSynsetId())
+                    .distinct()
+                    .toList();
+            if (targetIli != null && !linkedIds.isEmpty()) {
+                synsetRepository.findAllById(linkedIds).forEach(s -> iliBySynset.put(s.getId(), s.getIli()));
+            }
             if (targetIli != null) {
-                for (var existing : submissionRepository.findActiveByLemmaAndPos(word, pos)) {
+                for (var existing : openSubs) {
                     String existingIli = existing.getSynsetAction() == SynsetAction.LINK
-                            ? (existing.getSynsetId() == null
-                                    ? null
-                                    : synsetRepository.findById(existing.getSynsetId()).map(SynsetEntity::getIli).orElse(null))
+                            ? iliBySynset.get(existing.getSynsetId())
                             : existing.getIliCode();
                     if (targetIli.equalsIgnoreCase(existingIli == null ? "" : existingIli)
                             || (isNa(targetIli) && isNa(existingIli))) {
@@ -176,11 +189,6 @@ public class LexiconValidationService {
             out.put("errors", errors);
         }
         return out;
-    }
-
-    private boolean senseLinkedToIli(String word, PartOfSpeech pos, String ili) {
-        return senseRepository.findByLemmaAndPos(word, pos).stream()
-                .anyMatch(s -> ili.equalsIgnoreCase(s.getSynset().getIli()));
     }
 
     public static boolean isNa(String ili) {

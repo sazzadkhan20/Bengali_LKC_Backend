@@ -38,3 +38,6 @@ docker/postgres-data/
 # Generated
 *.class
 hs_err_pid*
+
+# Local DB backups (contain password hashes)
+backups/

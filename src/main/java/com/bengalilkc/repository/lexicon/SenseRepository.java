@@ -11,6 +11,26 @@ import org.springframework.data.repository.query.Param;
 public interface SenseRepository extends JpaRepository<SenseEntity, String> {
     List<SenseEntity> findBySynsetId(String synsetId);
 
+    /** Member lemmas for many synsets in one query: rows of [synsetId, writtenForm]. */
+    @Query(
+            """
+            select s.synset.id, e.writtenForm from SenseEntity s
+            join s.lexicalEntry e
+            where s.synset.id in :synsetIds
+            order by s.synset.id, e.writtenForm
+            """)
+    List<Object[]> findLemmasBySynsetIds(@Param("synsetIds") java.util.Collection<String> synsetIds);
+
+    /** Display rows for sense-relation targets: [senseId, writtenForm, pos, synsetId, synsetDefinition]. */
+    @Query(
+            """
+            select s.id, e.writtenForm, e.partOfSpeech, syn.id, syn.definitionText from SenseEntity s
+            join s.lexicalEntry e
+            join s.synset syn
+            where s.id in :senseIds
+            """)
+    List<Object[]> findSummariesByIds(@Param("senseIds") java.util.Collection<String> senseIds);
+
     List<SenseEntity> findByLexicalEntryId(String lexicalEntryId);
 
     /** Prefix search by lemma for Quick Input autocomplete (sense-rel targets). */

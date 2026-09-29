@@ -49,12 +49,9 @@ public class DashboardController {
     public Map<String, Object> queues() {
         SecurityUtils.requirePrincipal();
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("pendingReview", submissionService.list().stream()
-                .filter(s -> EntryState.PENDING_REVIEW.name().equals(s.get("state"))).toList());
-        m.put("editorApproved", submissionService.list().stream()
-                .filter(s -> EntryState.EDITOR_APPROVED.name().equals(s.get("state"))).toList());
-        m.put("underReview", submissionService.list().stream()
-                .filter(s -> EntryState.UNDER_REVIEW.name().equals(s.get("state"))).toList());
+        m.put("pendingReview", submissionService.listByState(EntryState.PENDING_REVIEW));
+        m.put("editorApproved", submissionService.listByState(EntryState.EDITOR_APPROVED));
+        m.put("underReview", submissionService.listByState(EntryState.UNDER_REVIEW));
         m.put("arbitration", arbitrationService.list());
         return m;
     }

@@ -26,7 +26,7 @@ public final class PermissionMatrix {
         grant(map, Permission.AUDIT_LOG, Role.PLATFORM_ARCHITECT, Role.SYSTEM_MODERATOR);
         grant(map, Permission.XML_EXPORT, Role.PLATFORM_ARCHITECT, Role.SYSTEM_MODERATOR);
         grant(map, Permission.QUICK_INPUT, Role.PLATFORM_ARCHITECT, Role.SYSTEM_MODERATOR, Role.CONTRIBUTOR);
-        grant(map, Permission.DIRECT_APPROVAL, Role.SYSTEM_MODERATOR);
+        grant(map, Permission.DIRECT_APPROVAL, Role.PLATFORM_ARCHITECT, Role.SYSTEM_MODERATOR);
         grant(map, Permission.VIEW_PENDING_QUEUE, Role.PLATFORM_ARCHITECT, Role.SYSTEM_MODERATOR, Role.LEXICAL_EDITOR);
         grant(map, Permission.PRIMARY_VALIDATE, Role.PLATFORM_ARCHITECT, Role.SYSTEM_MODERATOR, Role.LEXICAL_EDITOR);
         grant(map, Permission.VIEW_EDITOR_APPROVED_QUEUE, Role.PLATFORM_ARCHITECT, Role.SYSTEM_MODERATOR, Role.CHIEF_LEXICAL_EDITOR);
