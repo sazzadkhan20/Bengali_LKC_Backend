@@ -93,7 +93,10 @@ public class LexiconValidationService {
         String nearDuplicate = null;
         if (errors.isEmpty() && pos != null && !word.isEmpty()) {
             List<SenseEntity> existingSenses = senseRepository.findByLemmaAndPos(word, pos);
-            var openSubs = submissionRepository.findActiveByLemmaAndPos(word, pos);
+            String excludeId = str(body.get("excludeSubmissionId")).trim();
+            var openSubs = submissionRepository.findActiveByLemmaAndPos(word, pos).stream()
+                    .filter(s -> !s.getId().equals(excludeId))
+                    .toList();
             boolean lexiconNear = !existingSenses.isEmpty();
             boolean submissionNear = !openSubs.isEmpty();
             if ((lexiconNear || submissionNear) && action == SynsetAction.LINK && synsetId != null) {

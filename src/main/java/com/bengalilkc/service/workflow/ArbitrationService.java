@@ -83,10 +83,16 @@ public class ArbitrationService {
         if (comment.length() < 30) {
             throw ApiException.unprocessable("Escalation notes must be at least 30 characters.");
         }
+        return startEscalation(principal, sub, comment);
+    }
+
+    /** Opens the case and moves the entry to ARBITRATION; callers validate role, state and note. */
+    @Transactional
+    public Map<String, Object> startEscalation(UserPrincipal principal, Submission sub, String comment) {
         String caseId = createCase(sub, principal.getId(), sub.getContributorId(), DisputeType.ESCALATION, comment, sub.getState());
         submissionService.transition(sub, EntryState.ARBITRATION, principal.getId(), principal.getRole().name(), comment);
         auditService.record(principal, "CASE_OPENED", AuditTargetType.ARBITRATION, caseId,
-                "Escalation for \"" + sub.getWrittenForm() + "\" — 72-hour response window started");
+                "Reviewer dispute for \"" + sub.getWrittenForm() + "\" — contributor has 72 hours to respond");
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ok", true);
         body.put("state", sub.getState().name());
@@ -98,25 +104,33 @@ public class ArbitrationService {
     public Map<String, Object> openDispute(UserPrincipal principal, Submission sub, String comment) {
         if (!sub.getContributorId().equals(principal.getId())
                 || !PermissionMatrix.has(principal.getRole(), Permission.DISPUTE)) {
-            throw ApiException.forbidden("Only the submitting contributor may dispute.");
+            throw ApiException.forbidden("Only the contributor who submitted this entry can dispute it.");
         }
-        if (!List.of(EntryState.REJECTED, EntryState.FLAGGED, EntryState.C_FLAGGED).contains(sub.getState())) {
-            throw ApiException.unprocessable(
-                    "Disputes are only available on REJECTED, FLAGGED or C-FLAGGED entries.");
+        String note = comment == null ? "" : comment.strip();
+        if (note.isEmpty()) {
+            throw ApiException.unprocessable(Map.of("note", "A dispute note is required."));
         }
-        if (comment.length() < 30) {
-            throw ApiException.unprocessable(
-                    "A dispute note of at least 30 characters is mandatory (SRS §7.3.3).");
+        if (note.length() < SubmissionService.DISPUTE_NOTE_MIN) {
+            throw ApiException.unprocessable(Map.of("note",
+                    "Dispute note must be at least " + SubmissionService.DISPUTE_NOTE_MIN + " characters."));
         }
+        if (note.length() > SubmissionService.DISPUTE_NOTE_MAX) {
+            throw ApiException.unprocessable(Map.of("note",
+                    "Dispute note must be at most " + SubmissionService.DISPUTE_NOTE_MAX + " characters."));
+        }
+        if (sub.getState() != EntryState.FLAGGED && sub.getState() != EntryState.C_FLAGGED) {
+            throw ApiException.conflict("This entry is now " + sub.getState().name()
+                    + "; only FLAGGED or C_FLAGGED entries can be disputed.");
+        }
+        EntryState flaggedState = sub.getState();
         String accusedId = transitionRepository.findBySubmissionIdOrderByCreatedAtAsc(sub.getId()).stream()
                 .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
-                .filter(h -> List.of(EntryState.REJECTED, EntryState.FLAGGED, EntryState.C_FLAGGED).contains(h.getToState()))
+                .filter(h -> h.getToState() == flaggedState)
                 .map(StateTransition::getActorId)
                 .findFirst()
-                .orElse("u-le1");
-        DisputeType type = sub.getState() == EntryState.REJECTED ? DisputeType.DISPUTE_REJECTION : DisputeType.DISPUTE_FLAG;
-        String caseId = createCase(sub, principal.getId(), accusedId, type, comment, sub.getState());
-        submissionService.transition(sub, EntryState.ARBITRATION, principal.getId(), principal.getRole().name(), comment);
+                .orElse(sub.getLastUpdatedBy());
+        String caseId = createCase(sub, principal.getId(), accusedId, DisputeType.DISPUTE_FLAG, note, flaggedState);
+        submissionService.transition(sub, EntryState.ARBITRATION, principal.getId(), principal.getRole().name(), note);
         auditService.record(principal, "CASE_OPENED", AuditTargetType.ARBITRATION, caseId,
                 "Contributor dispute for \"" + sub.getWrittenForm()
                         + "\" — accused party has 72 hours to respond");
