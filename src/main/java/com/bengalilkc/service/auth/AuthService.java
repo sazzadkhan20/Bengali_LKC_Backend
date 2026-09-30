@@ -226,7 +226,7 @@ public class AuthService {
         int min = configService.getConfig().getPasswordMinLength();
         if (next.length() < min) {
             throw ApiException.unprocessable(
-                    "New password must be at least " + min + " characters (password policy, SRS §3.2).");
+                    "New password must be at least " + min + " characters.");
         }
         if (passwordEncoder.matches(next, credential.getPasswordHash())) {
             throw ApiException.unprocessable("New password must be different from the current password.");

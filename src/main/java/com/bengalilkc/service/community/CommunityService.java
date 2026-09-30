@@ -89,7 +89,7 @@ public class CommunityService {
             throw ApiException.unprocessable("Post text is required.");
         }
         if (text.length() > 500) {
-            throw ApiException.unprocessable("Posts are limited to 500 characters (SRS §14.2).");
+            throw ApiException.unprocessable("Posts are limited to 500 characters.");
         }
         String id = "post-" + idGeneratorService.nextValue("post");
         postRepository.save(CommunityPost.builder()
@@ -159,7 +159,7 @@ public class CommunityService {
                     throw ApiException.unprocessable("Reply text is required.");
                 }
                 if (text.length() > 200) {
-                    throw ApiException.unprocessable("Replies are limited to 200 characters (SRS §14.2).");
+                    throw ApiException.unprocessable("Replies are limited to 200 characters.");
                 }
                 replyRepository.save(PostReply.builder()
                         .id("reply-" + idGeneratorService.nextValue("reply"))
@@ -233,7 +233,7 @@ public class CommunityService {
                     credentialRepository.save(c);
                 });
                 auditService.record(principal, "ACCOUNT_SUSPENDED", AuditTargetType.USER, author.getId(),
-                        author.getName() + " suspended over community post " + postId + " (SRS §14.5)");
+                        author.getName() + " suspended over community post " + postId);
                 yield Map.of("ok", true);
             }
             default -> throw ApiException.unprocessable("Unknown action.");

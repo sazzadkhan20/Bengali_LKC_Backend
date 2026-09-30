@@ -5,7 +5,9 @@ import com.bengalilkc.common.SynsetRelationPayload;
 import com.bengalilkc.common.exception.ApiException;
 import com.bengalilkc.domain.entity.identity.AppUser;
 import com.bengalilkc.domain.entity.lexicon.SynsetEntity;
+import com.bengalilkc.domain.entity.workflow.ArbitrationCase;
 import com.bengalilkc.domain.entity.workflow.Submission;
+import com.bengalilkc.domain.enums.ArbitrationStatus;
 import com.bengalilkc.domain.enums.EntryState;
 import com.bengalilkc.domain.enums.PartOfSpeech;
 import com.bengalilkc.domain.enums.Permission;
@@ -24,6 +26,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -59,6 +62,7 @@ public class SubmissionBrowseService {
     private final ArbitrationCaseRepository caseRepository;
     private final SenseRepository senseRepository;
     private final WordnetIliRepository wordnetIliRepository;
+    private final ReviewService reviewService;
 
     /**
      * Full submission for the detail page, with display names, the linked synset,
@@ -142,7 +146,22 @@ public class SubmissionBrowseService {
         m.put("senseRelationDetails", senseRelationDetails(senseRels));
         m.put("synsetRelationDetails", synsetRelationDetails(synsetRels));
 
-        m.put("cases", caseRepository.findBySubmissionId(sub.getId()).stream()
+        var cases = caseRepository.findBySubmissionId(sub.getId());
+        Map<String, Object> ownerActions = submissionService.ownerOptions(principal, sub, cases);
+        if (ownerActions != null) {
+            m.put("ownerActions", ownerActions);
+        }
+        ArbitrationCase activeCase = sub.getState() == EntryState.ARBITRATION
+                ? cases.stream()
+                        .filter(c -> c.getStatus() != ArbitrationStatus.RESOLVED)
+                        .max(Comparator.comparing(ArbitrationCase::getOpenedAt,
+                                Comparator.nullsFirst(Comparator.naturalOrder())))
+                        .orElse(null)
+                : null;
+        boolean otherStagesDispute = activeCase != null
+                && !ownsArbitrationStage(principal.getRole(), preArbitrationState(activeCase, history));
+        m.put("cases", cases.stream()
+                .filter(c -> !(otherStagesDispute && c == activeCase))
                 .map(c -> {
                     Map<String, Object> cm = new LinkedHashMap<>();
                     cm.put("id", c.getId());
@@ -163,7 +182,41 @@ public class SubmissionBrowseService {
             }
             m.put("reviewers", reviewers);
         }
+        Map<String, Object> review = otherStagesDispute ? null : reviewService.options(principal, sub);
+        if (review != null) {
+            m.put("review", review);
+        }
         return m;
+    }
+
+    /**
+     * An arbitration belongs to the review stage it came from: PENDING_REVIEW / FLAGGED to the Lexical
+     * Editor, EDITOR_APPROVED / C_FLAGGED to the Chief Lexical Editor. Other roles, and disputes from
+     * any other state, are not restricted.
+     */
+    private static boolean ownsArbitrationStage(Role role, EntryState preState) {
+        if (preState == null || (role != Role.LEXICAL_EDITOR && role != Role.CHIEF_LEXICAL_EDITOR)) {
+            return true;
+        }
+        return switch (preState) {
+            case PENDING_REVIEW, FLAGGED -> role == Role.LEXICAL_EDITOR;
+            case EDITOR_APPROVED, C_FLAGGED -> role == Role.CHIEF_LEXICAL_EDITOR;
+            default -> true;
+        };
+    }
+
+    /** The case's recorded pre-arbitration state, else the state the entry left when it entered ARBITRATION. */
+    private static EntryState preArbitrationState(ArbitrationCase c, List<Map<String, Object>> history) {
+        if (c.getPreArbitrationState() != null) {
+            return c.getPreArbitrationState();
+        }
+        for (int i = history.size() - 1; i >= 0; i--) {
+            Map<String, Object> h = history.get(i);
+            if (EntryState.ARBITRATION.name().equals(h.get("to")) && h.get("from") != null) {
+                return EntryState.valueOf((String) h.get("from"));
+            }
+        }
+        return null;
     }
 
     /** Sense-relation rows resolved to the target word, its POS and its synset gloss. */
@@ -332,6 +385,110 @@ public class SubmissionBrowseService {
         body.put("totalElements", total);
         body.put("totalPages", (int) ((total + size - 1) / size));
         body.put("lastUpdatedAt", lastUpdated != null ? lastUpdated.toInstant().toString() : null);
+        body.put("filters", filters);
+        return body;
+    }
+
+    public record HistoryCriteria(String q, String state, Integer page, Integer size) {}
+
+    /**
+     * Current states that never appear in a reviewer's history: those entries are back in (or
+     * not yet out of) a review queue, or are states the role never produces.
+     */
+    private static final Map<Role, Set<EntryState>> HISTORY_EXCLUDED = Map.of(
+            Role.LEXICAL_EDITOR, Set.of(EntryState.DRAFT, EntryState.PENDING_REVIEW),
+            Role.CHIEF_LEXICAL_EDITOR, Set.of(
+                    EntryState.DRAFT, EntryState.PENDING_REVIEW, EntryState.EDITOR_APPROVED, EntryState.FLAGGED));
+
+    /**
+     * My Review History (Lexical Editor) / My Validation History (Chief Lexical Editor): entries whose
+     * status the caller changed on someone else's submission, shown with their current state and the
+     * caller's latest decision, newest decision first.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> history(UserPrincipal principal, HistoryCriteria c) {
+        Set<EntryState> excluded = HISTORY_EXCLUDED.get(principal.getRole());
+        if (excluded == null) {
+            throw ApiException.forbidden("Only Lexical Editors and Chief Lexical Editors have a review history.");
+        }
+        List<String> available = Stream.of(EntryState.values())
+                .filter(s -> !excluded.contains(s))
+                .map(Enum::name)
+                .toList();
+        EntryState state = parseState(c.state());
+        if (state != null && excluded.contains(state)) {
+            throw ApiException.badRequest(Map.of("state", "This status is not part of your history."));
+        }
+
+        int size = c.size() == null ? DEFAULT_SIZE : Math.max(1, Math.min(MAX_SIZE, c.size()));
+        int page = c.page() == null ? 0 : Math.max(0, c.page());
+        String q = normalizeQuery(c.q());
+
+        MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("me", principal.getId())
+                .addValue("available", available);
+        StringBuilder where = new StringBuilder(" where s.state in (:available)");
+        if (state != null) {
+            where.append(" and s.state = :state");
+            params.addValue("state", state.name());
+        }
+        if (q != null) {
+            where.append(" and (lower(s.written_form) like :like escape '!'")
+                    .append(" or lower(s.definition_text) like :like escape '!'")
+                    .append(" or s.synset_id in (select sy.id from synset sy")
+                    .append(" where lower(sy.definition_text) like :like escape '!'))");
+            params.addValue("like", "%" + escapeLike(q.toLowerCase(Locale.ROOT)) + "%");
+        }
+        String mine = """
+                with mine as (
+                    select t.submission_id, max(t.created_at) as my_last_at
+                    from state_transition t
+                    join submission own on own.id = t.submission_id
+                    where t.actor_id = :me and t.from_state is not null and own.contributor_id <> :me
+                    group by t.submission_id
+                )
+                """;
+
+        Map<String, Object> agg = jdbc.queryForMap(mine
+                + "select count(*) as total, max(s.updated_at) as last_updated"
+                + " from mine m join submission s on s.id = m.submission_id" + where, params);
+        long total = ((Number) agg.get("total")).longValue();
+        Timestamp lastUpdated = (Timestamp) agg.get("last_updated");
+
+        List<Map<String, Object>> items = List.of();
+        if (total > (long) page * size) {
+            params.addValue("limit", size);
+            params.addValue("offset", (long) page * size);
+            items = jdbc.query(mine + """
+                    select s.id, s.state, s.written_form, s.part_of_speech, s.synset_action, s.synset_id,
+                           s.ili_code, s.definition_text, sy.definition_text as synset_definition,
+                           s.contributor_id, cu.name as contributor_name,
+                           s.assigned_to, au.name as assigned_to_name,
+                           s.last_updated_by, lu.name as last_updated_by_name,
+                           s.created_at, s.updated_at
+                    from mine m
+                    join submission s on s.id = m.submission_id
+                    left join synset sy on sy.id = s.synset_id
+                    left join app_user cu on cu.id = s.contributor_id
+                    left join app_user au on au.id = s.assigned_to
+                    left join app_user lu on lu.id = s.last_updated_by
+                    """ + where + " order by m.my_last_at desc, s.id desc limit :limit offset :offset",
+                    params,
+                    (rs, i) -> row(rs));
+        }
+
+        Map<String, Object> filters = new LinkedHashMap<>();
+        filters.put("q", q);
+        filters.put("state", state != null ? state.name() : null);
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("items", items);
+        body.put("page", page);
+        body.put("size", size);
+        body.put("totalElements", total);
+        body.put("totalPages", (int) ((total + size - 1) / size));
+        body.put("lastUpdatedAt", lastUpdated != null ? lastUpdated.toInstant().toString() : null);
+        body.put("availableStates", available);
         body.put("filters", filters);
         return body;
     }

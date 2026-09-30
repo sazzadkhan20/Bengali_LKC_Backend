@@ -3,8 +3,10 @@ package com.bengalilkc.service.workflow;
 import com.bengalilkc.common.SenseRelationPayload;
 import com.bengalilkc.common.SynsetRelationPayload;
 import com.bengalilkc.common.exception.ApiException;
+import com.bengalilkc.domain.entity.workflow.ArbitrationCase;
 import com.bengalilkc.domain.entity.workflow.StateTransition;
 import com.bengalilkc.domain.entity.workflow.Submission;
+import com.bengalilkc.domain.enums.ArbitrationStatus;
 import com.bengalilkc.domain.enums.AuditTargetType;
 import com.bengalilkc.domain.enums.DefinitionLanguage;
 import com.bengalilkc.domain.enums.EntryState;
@@ -43,6 +45,9 @@ public class SubmissionService {
 
     private static final Pattern BENGALI = Pattern.compile("[\\u0980-\\u09ff]");
     private static final Pattern ILI = Pattern.compile("^\\d{8}-[nvar]$");
+
+    public static final int DISPUTE_NOTE_MIN = 15;
+    public static final int DISPUTE_NOTE_MAX = 1000;
 
     private static final Set<String> SENSE_REL_TYPES = Set.of("derivation", "antonym", "metonym");
     private static final Set<String> SYNSET_REL_TYPES =
@@ -141,6 +146,351 @@ public class SubmissionService {
             }
         }
 
+        EntryInput in = validateEntry(p, errors);
+
+        boolean directApprove = bool(p.get("directApprove"))
+                && PermissionMatrix.has(principal.getRole(), Permission.DIRECT_APPROVAL);
+        String justification = str(p.get("directApproveJustification")).trim();
+        if (directApprove && justification.length() < 20) {
+            errors.put("directApproveJustification",
+                    "Direct approval requires a written justification of at least 20 characters.");
+        }
+
+        if (!errors.isEmpty()) {
+            throw ApiException.unprocessable(errors);
+        }
+
+        checkDuplicates(in, null, bool(p.get("confirmNearDuplicate")));
+
+        String id = "sub-" + idGeneratorService.nextValue("submission");
+        Instant now = Instant.now();
+        Submission sub = Submission.builder()
+                .id(id)
+                .state(EntryState.DRAFT)
+                .contributorId(principal.getId())
+                .createdAt(now)
+                .build();
+        applyEntry(sub, in);
+        sub.setUpdatedAt(now);
+        sub.setLastUpdatedBy(principal.getId());
+        submissionRepository.save(sub);
+        recordTransition(sub, null, EntryState.DRAFT, principal.getId(), principal.getRole().name(), null);
+        auditService.record(principal, "SUBMISSION_CREATED", AuditTargetType.SUBMISSION, id,
+                "\"" + in.word() + "\" (" + in.pos().getCode() + ")");
+
+        if (!saveAsDraft) {
+            if (holdUnderReview) {
+                // Bypass normal LE/CLE queue until a System Moderator clears the anti-bot hold.
+                transition(
+                        sub,
+                        EntryState.UNDER_REVIEW,
+                        principal.getId(),
+                        principal.getRole().name(),
+                        "Auto-held: form completed faster than minimum "
+                                + config.getMinSubmissionSeconds()
+                                + "s (anti-bot).");
+            } else if (directApprove) {
+                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
+                transition(sub, EntryState.VALIDATED, principal.getId(), principal.getRole().name(),
+                        "Direct approval: " + justification);
+                sub.setValidatedBy(principal.getId());
+                sub.setValidatedAt(Instant.now());
+                sub.setRewardEligible(false);
+                submissionRepository.save(sub);
+            } else {
+                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
+            }
+        }
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ok", true);
+        body.put("id", sub.getId());
+        body.put("state", sub.getState().name());
+        if (holdUnderReview) {
+            body.put(
+                    "message",
+                    "Submitted but held UNDER_REVIEW for anti-bot checks. A System Moderator will clear it.");
+        }
+        return body;
+    }
+
+    @Transactional
+    public Map<String, Object> action(UserPrincipal principal, String id, Map<String, Object> p) {
+        Submission sub = require(id);
+        String action = str(p.get("action")).trim();
+        String comment = str(p.get("comment")).trim();
+        Role role = principal.getRole();
+        boolean isOwner = sub.getContributorId().equals(principal.getId());
+
+        return switch (action) {
+            case "approve" -> {
+                requirePerm(role, Permission.PRIMARY_VALIDATE);
+                requireState(sub, EntryState.PENDING_REVIEW, "Only PENDING_REVIEW entries can be approved.");
+                transition(sub, EntryState.EDITOR_APPROVED, principal.getId(), role.name(),
+                        comment.isEmpty() ? "Structure and data quality verified." : comment);
+                yield okState(sub);
+            }
+            case "flag" -> {
+                requirePerm(role, Permission.PRIMARY_VALIDATE);
+                requireState(sub, EntryState.PENDING_REVIEW, "Only PENDING_REVIEW entries can be flagged.");
+                if (comment.length() < 15) {
+                    throw ApiException.unprocessable("Flag comment must be at least 15 characters.");
+                }
+                sub.setEditorComment(comment);
+                transition(sub, EntryState.FLAGGED, principal.getId(), role.name(), comment);
+                yield okState(sub);
+            }
+            case "reject" -> {
+                requirePerm(role, Permission.PRIMARY_VALIDATE);
+                requireState(sub, EntryState.PENDING_REVIEW, "Only PENDING_REVIEW entries can be rejected.");
+                if (comment.isEmpty()) {
+                    throw ApiException.unprocessable("A rejection reason is mandatory.");
+                }
+                sub.setRejectionReason(comment);
+                transition(sub, EntryState.REJECTED, principal.getId(), role.name(), comment);
+                yield okState(sub);
+            }
+            case "cflag" -> {
+                requirePerm(role, Permission.FINAL_VALIDATE);
+                requireState(sub, EntryState.EDITOR_APPROVED, "Only EDITOR_APPROVED entries can be C-flagged.");
+                if (comment.length() < 15) {
+                    throw ApiException.unprocessable("Linguistic note must be at least 15 characters.");
+                }
+                sub.setCleComment(comment);
+                transition(sub, EntryState.C_FLAGGED, principal.getId(), role.name(), comment);
+                auditService.recordSystem("NOTIFY", AuditTargetType.SUBMISSION, sub.getId(),
+                        "C_FLAG notification sent to Lexical Editor and Contributor simultaneously");
+                yield okState(sub);
+            }
+            case "validate" -> {
+                requirePerm(role, Permission.FINAL_VALIDATE);
+                requireState(sub, EntryState.EDITOR_APPROVED, "Only EDITOR_APPROVED entries can be validated.");
+                transition(sub, EntryState.VALIDATED, principal.getId(), role.name(),
+                        comment.isEmpty() ? "Linguistically correct. Approved for export." : comment);
+                sub.setValidatedBy(principal.getId());
+                sub.setValidatedAt(Instant.now());
+                submissionRepository.save(sub);
+                leaderboardService.announceValidationMilestones(sub);
+                yield okState(sub);
+            }
+            case "escalate" -> arbitrationService.openEscalation(principal, sub, comment);
+            case "resubmit" -> resubmit(principal, id, p);
+            case "submit_draft" -> {
+                if (!isOwner) {
+                    throw ApiException.forbidden("Only the owner can submit a draft.");
+                }
+                requireState(sub, EntryState.DRAFT, "Entry is not a draft.");
+                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), role.name(), null);
+                yield okState(sub);
+            }
+            case "delete_draft" -> {
+                if (!isOwner) {
+                    throw ApiException.forbidden("Only the owner can delete a draft.");
+                }
+                requireState(sub, EntryState.DRAFT, "Only DRAFT entries can be deleted.");
+                transitionRepository.findBySubmissionIdOrderByCreatedAtAsc(sub.getId())
+                        .forEach(transitionRepository::delete);
+                submissionRepository.delete(sub);
+                auditService.record(principal, "DRAFT_DELETED", AuditTargetType.SUBMISSION, sub.getId(),
+                        "\"" + sub.getWrittenForm() + "\"");
+                yield Map.of("ok", true);
+            }
+            case "dispute" -> {
+                Map<String, Object> body = new LinkedHashMap<>(p);
+                body.putIfAbsent("note", comment);
+                yield dispute(principal, id, body);
+            }
+            case "clear_under_review" -> {
+                requirePerm(role, Permission.OVERRIDE_STATE);
+                requireState(sub, EntryState.UNDER_REVIEW, "Entry is not under anti-bot review.");
+                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), role.name(),
+                        comment.isEmpty() ? "Anti-bot hold cleared after manual review." : comment);
+                yield okState(sub);
+            }
+            case "override" -> {
+                requirePerm(role, Permission.OVERRIDE_STATE);
+                EntryState target;
+                try {
+                    target = EntryState.valueOf(str(p.get("targetState")));
+                } catch (Exception e) {
+                    throw ApiException.unprocessable("Target state is required.");
+                }
+                if (comment.isEmpty()) {
+                    throw ApiException.unprocessable("Emergency overrides require a mandatory reason.");
+                }
+                transition(sub, target, principal.getId(), role.name(), "EMERGENCY OVERRIDE: " + comment);
+                if (target == EntryState.VALIDATED) {
+                    sub.setValidatedBy(principal.getId());
+                    sub.setValidatedAt(Instant.now());
+                    sub.setRewardEligible(false);
+                }
+                if (target == EntryState.REJECTED) {
+                    sub.setRejectionReason(comment);
+                }
+                submissionRepository.save(sub);
+                yield okState(sub);
+            }
+            case "assign" -> {
+                requirePerm(role, Permission.ASSIGN_ENTRIES);
+                String assignTo = blankToNull(str(p.get("assignTo")));
+                sub.setAssignedTo(assignTo);
+                sub.setLastUpdatedBy(principal.getId());
+                sub.setUpdatedAt(Instant.now());
+                submissionRepository.save(sub);
+                auditService.record(principal, "ENTRY_ASSIGNED", AuditTargetType.SUBMISSION, sub.getId(),
+                        "Assigned to " + (assignTo != null ? assignTo : "(unassigned)"));
+                yield Map.of("ok", true);
+            }
+            default -> throw ApiException.unprocessable("Unknown action.");
+        };
+    }
+
+    /**
+     * Corrected resubmission of the caller's own FLAGGED / C-FLAGGED entry. The full entry is
+     * re-validated exactly as a new Quick Input submission; a FLAGGED entry returns to the
+     * Lexical Editor queue, a C-FLAGGED entry returns to the Chief Editor queue.
+     */
+    @Transactional
+    public Map<String, Object> resubmit(UserPrincipal principal, String id, Map<String, Object> p) {
+        Submission sub = require(id);
+        if (!sub.getContributorId().equals(principal.getId())) {
+            throw ApiException.forbidden("Only the contributor who submitted this entry can resubmit it.");
+        }
+        EntryState from = sub.getState();
+        EntryState target = resubmitTarget(from);
+        if (target == null) {
+            throw ApiException.conflict("This entry is now " + from.name()
+                    + "; only FLAGGED or C_FLAGGED entries can be resubmitted.");
+        }
+        requireVersion(sub, p.get("expectedVersion"));
+
+        Map<String, String> errors = new LinkedHashMap<>();
+        boolean isModerator = principal.getRole() == Role.SYSTEM_MODERATOR
+                || principal.getRole() == Role.PLATFORM_ARCHITECT;
+        if (!isModerator && configService.getConfig().isCaptchaEnabled() && !bool(p.get("captchaPassed"))) {
+            errors.put("captcha", "Please complete the CAPTCHA verification.");
+        }
+        EntryInput in = validateEntry(p, errors);
+        if (!errors.isEmpty()) {
+            throw ApiException.unprocessable(errors);
+        }
+        List<String> changed = changedFields(sub, in);
+        if (changed.isEmpty()) {
+            throw ApiException.unprocessable(Map.of("form",
+                    "No changes detected. Edit the entry to address the reviewer's feedback, "
+                            + "or dispute the decision instead."));
+        }
+        checkDuplicates(in, sub.getId(), bool(p.get("confirmNearDuplicate")));
+
+        applyEntry(sub, in);
+        String comment = "Corrected and resubmitted by contributor. Changed: " + String.join(", ", changed) + ".";
+        transition(sub, target, principal.getId(), principal.getRole().name(), comment);
+        auditService.record(principal, "SUBMISSION_RESUBMITTED", AuditTargetType.SUBMISSION, sub.getId(),
+                "\"" + sub.getWrittenForm() + "\" " + from.name() + " → " + target.name());
+        submissionRepository.flush();
+
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("ok", true);
+        res.put("id", sub.getId());
+        res.put("previousState", from.name());
+        res.put("state", sub.getState().name());
+        res.put("changed", changed);
+        res.put("version", sub.getVersion());
+        return res;
+    }
+
+    /** Contributor dispute of a FLAGGED / C-FLAGGED decision; opens an arbitration case. */
+    @Transactional
+    public Map<String, Object> dispute(UserPrincipal principal, String id, Map<String, Object> p) {
+        Submission sub = require(id);
+        String note = str(p.get("note")).strip();
+        EntryState from = sub.getState();
+        if (sub.getContributorId().equals(principal.getId())) {
+            requireVersion(sub, p.get("expectedVersion"));
+        }
+        Map<String, Object> res = new LinkedHashMap<>(arbitrationService.openDispute(principal, sub, note));
+        submissionRepository.flush();
+        res.put("id", sub.getId());
+        res.put("previousState", from.name());
+        res.put("version", sub.getVersion());
+        return res;
+    }
+
+    /**
+     * Actions the owner may take on their own entry right now, so the detail page renders
+     * exactly what the API accepts. Returns null when the caller is not the owner.
+     */
+    public Map<String, Object> ownerOptions(UserPrincipal principal, Submission sub, List<ArbitrationCase> cases) {
+        if (!sub.getContributorId().equals(principal.getId())) {
+            return null;
+        }
+        List<Map<String, Object>> actions = new ArrayList<>();
+        switch (sub.getState()) {
+            case DRAFT -> {
+                actions.add(ownerAction("SUBMIT_DRAFT", "Submit for review", EntryState.PENDING_REVIEW));
+                actions.add(ownerAction("DELETE_DRAFT", "Delete draft", null));
+            }
+            case FLAGGED, C_FLAGGED -> {
+                actions.add(ownerAction("RESUBMIT", "Resubmission", resubmitTarget(sub.getState())));
+                if (PermissionMatrix.has(principal.getRole(), Permission.DISPUTE)) {
+                    Map<String, Object> d = ownerAction("DISPUTE", "Dispute to arbitration", EntryState.ARBITRATION);
+                    d.put("noteMin", DISPUTE_NOTE_MIN);
+                    d.put("noteMax", DISPUTE_NOTE_MAX);
+                    actions.add(d);
+                }
+            }
+            default -> { }
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("actions", actions);
+        if (sub.getState() == EntryState.ARBITRATION) {
+            cases.stream()
+                    .filter(c -> c.getStatus() != ArbitrationStatus.RESOLVED)
+                    .max(java.util.Comparator.comparing(ArbitrationCase::getOpenedAt,
+                            java.util.Comparator.nullsFirst(java.util.Comparator.naturalOrder())))
+                    .ifPresent(c -> m.put("activeCase", Map.of("id", c.getId(), "status", c.getStatus().name())));
+        }
+        return m;
+    }
+
+    public static EntryState resubmitTarget(EntryState state) {
+        return switch (state) {
+            case FLAGGED -> EntryState.PENDING_REVIEW;
+            case C_FLAGGED -> EntryState.EDITOR_APPROVED;
+            default -> null;
+        };
+    }
+
+    private static Map<String, Object> ownerAction(String action, String label, EntryState toState) {
+        Map<String, Object> a = new LinkedHashMap<>();
+        a.put("action", action);
+        a.put("label", label);
+        a.put("toState", toState != null ? toState.name() : null);
+        return a;
+    }
+
+    private static void requireVersion(Submission sub, Object expected) {
+        if (expected instanceof Number n && sub.getVersion() != null && n.longValue() != sub.getVersion()) {
+            throw ApiException.conflict(
+                    "This entry was updated after you opened it. Reload to see its current state.");
+        }
+    }
+
+    /** Parsed Quick Input fields; relation lists are normalised to rows with a target. */
+    private record EntryInput(
+            String word,
+            PartOfSpeech pos,
+            SynsetAction action,
+            String synsetId,
+            String iliCode,
+            String definitionText,
+            DefinitionLanguage definitionLanguage,
+            String reviewerNote,
+            List<SenseRelationPayload> senseRelations,
+            List<SynsetRelationPayload> synsetRelations) {}
+
+    /** Field validation shared by new entries and resubmissions; problems are added to {@code errors}. */
+    private EntryInput validateEntry(Map<String, Object> p, Map<String, String> errors) {
         String word = str(p.get("writtenForm")).trim();
         if (word.isEmpty()) {
             errors.put("writtenForm", "Bengali word is required.");
@@ -218,248 +568,100 @@ public class SubmissionService {
             errors.put("reviewerNote", "Note must be at most 500 characters.");
         }
 
-        boolean directApprove = bool(p.get("directApprove"))
-                && PermissionMatrix.has(principal.getRole(), Permission.DIRECT_APPROVAL);
-        String justification = str(p.get("directApproveJustification")).trim();
-        if (directApprove && justification.length() < 20) {
-            errors.put("directApproveJustification",
-                    "Direct approval requires a written justification of at least 20 characters.");
-        }
+        List<SenseRelationPayload> senseRels = readSense(writeJson(p.get("senseRelations"))).stream()
+                .filter(r -> r != null && r.relType() != null && r.target() != null && !r.target().isBlank())
+                .map(r -> new SenseRelationPayload(r.relType(), r.target().trim()))
+                .toList();
+        List<SynsetRelationPayload> synsetRels = readSynset(writeJson(p.get("synsetRelations"))).stream()
+                .filter(r -> r != null && r.relType() != null && r.target() != null && !r.target().isBlank())
+                .map(r -> new SynsetRelationPayload(r.relType(), r.target().trim()))
+                .toList();
 
-        if (!errors.isEmpty()) {
-            throw ApiException.unprocessable(errors);
-        }
+        return new EntryInput(word, pos, action,
+                action == SynsetAction.LINK ? synsetId : null,
+                action == SynsetAction.CREATE ? iliCode : null,
+                definitionText, definitionText != null ? defLang : null,
+                reviewerNote, senseRels, synsetRels);
+    }
 
-        String targetIli = action == SynsetAction.LINK
-                ? synsetRepository.findById(synsetId).map(SynsetEntity::getIli).orElse(null)
-                : iliCode;
-        for (Submission existing : submissionRepository.findActiveByLemmaAndPos(word, pos)) {
+    /**
+     * Exact duplicates against other open submissions are blocked (409 {@code duplicate});
+     * near duplicates need {@code confirmNearDuplicate}. {@code excludeId} skips the entry being edited.
+     */
+    private void checkDuplicates(EntryInput in, String excludeId, boolean confirmNear) {
+        List<Submission> open = submissionRepository.findActiveByLemmaAndPos(in.word(), in.pos()).stream()
+                .filter(s -> !s.getId().equals(excludeId))
+                .toList();
+        String targetIli = in.action() == SynsetAction.LINK
+                ? synsetRepository.findById(in.synsetId()).map(SynsetEntity::getIli).orElse(null)
+                : in.iliCode();
+        for (Submission existing : open) {
             String existingIli = existing.getSynsetAction() == SynsetAction.LINK
                     ? (existing.getSynsetId() == null
                             ? null
                             : synsetRepository.findById(existing.getSynsetId()).map(SynsetEntity::getIli).orElse(null))
                     : existing.getIliCode();
-            if (sameConcept(targetIli, existingIli, synsetId, existing.getSynsetId())) {
+            if (sameConcept(targetIli, existingIli, in.synsetId(), existing.getSynsetId())) {
                 throw ApiException.conflict(Map.of(
                         "duplicate",
-                        "Exact duplicate blocked: \"" + word + "\" (" + pos.getCode()
+                        "Exact duplicate blocked: \"" + in.word() + "\" (" + in.pos().getCode()
                                 + ") is already linked to the same concept (submission " + existing.getId() + ")."));
             }
         }
-        boolean lexiconNear = senseRepository.existsByLemmaAndPos(word, pos);
-        List<Submission> near = submissionRepository.findActiveByLemmaAndPos(word, pos);
-        if ((lexiconNear || !near.isEmpty()) && !bool(p.get("confirmNearDuplicate"))) {
+        boolean lexiconNear = senseRepository.existsByLemmaAndPos(in.word(), in.pos());
+        if ((lexiconNear || !open.isEmpty()) && !confirmNear) {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("nearDuplicate",
-                    "\"" + word + "\" (" + pos.getCode()
+                    "\"" + in.word() + "\" (" + in.pos().getCode()
                             + ") already exists with a different concept in the lexicon or an open submission. "
                             + "Confirm to proceed — this may be legitimate polysemy.");
             throw new NearDuplicateException(body);
         }
-
-        String id = "sub-" + idGeneratorService.nextValue("submission");
-        Instant now = Instant.now();
-        Submission sub = Submission.builder()
-                .id(id)
-                .state(EntryState.DRAFT)
-                .contributorId(principal.getId())
-                .writtenForm(word)
-                .partOfSpeech(pos)
-                .synsetAction(action)
-                .synsetId(action == SynsetAction.LINK ? synsetId : null)
-                .iliCode(action == SynsetAction.CREATE ? iliCode : null)
-                .definitionLanguage(definitionText != null ? (defLang != null ? defLang : DefinitionLanguage.BEN) : null)
-                .definitionText(definitionText)
-                .senseRelationsJson(writeJson(p.get("senseRelations")))
-                .synsetRelationsJson(writeJson(p.get("synsetRelations")))
-                .reviewerNote(reviewerNote)
-                .createdAt(now)
-                .updatedAt(now)
-                .lastUpdatedBy(principal.getId())
-                .build();
-        submissionRepository.save(sub);
-        recordTransition(sub, null, EntryState.DRAFT, principal.getId(), principal.getRole().name(), null);
-        auditService.record(principal, "SUBMISSION_CREATED", AuditTargetType.SUBMISSION, id,
-                "\"" + word + "\" (" + pos.getCode() + ")");
-
-        if (!saveAsDraft) {
-            if (holdUnderReview) {
-                // Bypass normal LE/CLE queue until a System Moderator clears the anti-bot hold.
-                transition(
-                        sub,
-                        EntryState.UNDER_REVIEW,
-                        principal.getId(),
-                        principal.getRole().name(),
-                        "Auto-held: form completed faster than minimum "
-                                + config.getMinSubmissionSeconds()
-                                + "s (anti-bot).");
-            } else if (directApprove) {
-                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
-                transition(sub, EntryState.VALIDATED, principal.getId(), principal.getRole().name(),
-                        "Direct approval: " + justification);
-                sub.setValidatedBy(principal.getId());
-                sub.setValidatedAt(Instant.now());
-                sub.setRewardEligible(false);
-                submissionRepository.save(sub);
-            } else {
-                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
-            }
-        }
-
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("ok", true);
-        body.put("id", sub.getId());
-        body.put("state", sub.getState().name());
-        if (holdUnderReview) {
-            body.put(
-                    "message",
-                    "Submitted but held UNDER_REVIEW for anti-bot checks. A System Moderator will clear it.");
-        }
-        return body;
     }
 
-    @Transactional
-    public Map<String, Object> action(UserPrincipal principal, String id, Map<String, Object> p) {
-        Submission sub = require(id);
-        String action = str(p.get("action")).trim();
-        String comment = str(p.get("comment")).trim();
-        Role role = principal.getRole();
-        boolean isOwner = sub.getContributorId().equals(principal.getId());
+    private void applyEntry(Submission sub, EntryInput in) {
+        sub.setWrittenForm(in.word());
+        sub.setPartOfSpeech(in.pos());
+        sub.setSynsetAction(in.action());
+        sub.setSynsetId(in.synsetId());
+        sub.setIliCode(in.iliCode());
+        sub.setDefinitionText(in.definitionText());
+        sub.setDefinitionLanguage(in.definitionLanguage());
+        sub.setReviewerNote(in.reviewerNote());
+        sub.setSenseRelationsJson(writeJson(in.senseRelations()));
+        sub.setSynsetRelationsJson(writeJson(in.synsetRelations()));
+    }
 
-        return switch (action) {
-            case "approve" -> {
-                requirePerm(role, Permission.PRIMARY_VALIDATE);
-                requireState(sub, EntryState.PENDING_REVIEW, "Only PENDING_REVIEW entries can be approved.");
-                transition(sub, EntryState.EDITOR_APPROVED, principal.getId(), role.name(),
-                        comment.isEmpty() ? "Structure and data quality verified." : comment);
-                yield okState(sub);
-            }
-            case "flag" -> {
-                requirePerm(role, Permission.PRIMARY_VALIDATE);
-                requireState(sub, EntryState.PENDING_REVIEW, "Only PENDING_REVIEW entries can be flagged.");
-                if (comment.length() < 15) {
-                    throw ApiException.unprocessable("Flag comment must be at least 15 characters (SRS §7.4.3).");
-                }
-                sub.setEditorComment(comment);
-                transition(sub, EntryState.FLAGGED, principal.getId(), role.name(), comment);
-                yield okState(sub);
-            }
-            case "reject" -> {
-                requirePerm(role, Permission.PRIMARY_VALIDATE);
-                requireState(sub, EntryState.PENDING_REVIEW, "Only PENDING_REVIEW entries can be rejected.");
-                if (comment.isEmpty()) {
-                    throw ApiException.unprocessable("A rejection reason is mandatory.");
-                }
-                sub.setRejectionReason(comment);
-                transition(sub, EntryState.REJECTED, principal.getId(), role.name(), comment);
-                yield okState(sub);
-            }
-            case "cflag" -> {
-                requirePerm(role, Permission.FINAL_VALIDATE);
-                requireState(sub, EntryState.EDITOR_APPROVED, "Only EDITOR_APPROVED entries can be C-flagged.");
-                if (comment.length() < 15) {
-                    throw ApiException.unprocessable("Linguistic note must be at least 15 characters (SRS §7.5.4).");
-                }
-                sub.setCleComment(comment);
-                transition(sub, EntryState.C_FLAGGED, principal.getId(), role.name(), comment);
-                auditService.recordSystem("NOTIFY", AuditTargetType.SUBMISSION, sub.getId(),
-                        "C_FLAG notification sent to Lexical Editor and Contributor simultaneously");
-                yield okState(sub);
-            }
-            case "validate" -> {
-                requirePerm(role, Permission.FINAL_VALIDATE);
-                requireState(sub, EntryState.EDITOR_APPROVED, "Only EDITOR_APPROVED entries can be validated.");
-                transition(sub, EntryState.VALIDATED, principal.getId(), role.name(),
-                        comment.isEmpty() ? "Linguistically correct. Approved for export." : comment);
-                sub.setValidatedBy(principal.getId());
-                sub.setValidatedAt(Instant.now());
-                submissionRepository.save(sub);
-                leaderboardService.announceValidationMilestones(sub);
-                yield okState(sub);
-            }
-            case "escalate" -> arbitrationService.openEscalation(principal, sub, comment);
-            case "resubmit" -> {
-                if (!isOwner && !PermissionMatrix.has(role, Permission.OVERRIDE_STATE)) {
-                    throw ApiException.forbidden("Only the submitting contributor can resubmit.");
-                }
-                if (sub.getState() != EntryState.FLAGGED && sub.getState() != EntryState.C_FLAGGED) {
-                    throw ApiException.unprocessable("Only FLAGGED or C-FLAGGED entries can be resubmitted.");
-                }
-                String wf = blankToNull(str(p.get("writtenForm")).trim());
-                if (wf != null) {
-                    sub.setWrittenForm(wf);
-                }
-                if (p.containsKey("definitionText")) {
-                    sub.setDefinitionText(blankToNull(str(p.get("definitionText")).trim()));
-                }
-                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), role.name(),
-                        comment.isEmpty() ? "Corrected and resubmitted by contributor." : comment);
-                yield okState(sub);
-            }
-            case "submit_draft" -> {
-                if (!isOwner) {
-                    throw ApiException.forbidden("Only the owner can submit a draft.");
-                }
-                requireState(sub, EntryState.DRAFT, "Entry is not a draft.");
-                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), role.name(), null);
-                yield okState(sub);
-            }
-            case "delete_draft" -> {
-                if (!isOwner) {
-                    throw ApiException.forbidden("Only the owner can delete a draft.");
-                }
-                requireState(sub, EntryState.DRAFT, "Only DRAFT entries can be deleted.");
-                transitionRepository.findBySubmissionIdOrderByCreatedAtAsc(sub.getId())
-                        .forEach(transitionRepository::delete);
-                submissionRepository.delete(sub);
-                auditService.record(principal, "DRAFT_DELETED", AuditTargetType.SUBMISSION, sub.getId(),
-                        "\"" + sub.getWrittenForm() + "\"");
-                yield Map.of("ok", true);
-            }
-            case "dispute" -> arbitrationService.openDispute(principal, sub, comment);
-            case "clear_under_review" -> {
-                requirePerm(role, Permission.OVERRIDE_STATE);
-                requireState(sub, EntryState.UNDER_REVIEW, "Entry is not under anti-bot review.");
-                transition(sub, EntryState.PENDING_REVIEW, principal.getId(), role.name(),
-                        comment.isEmpty() ? "Anti-bot hold cleared after manual review." : comment);
-                yield okState(sub);
-            }
-            case "override" -> {
-                requirePerm(role, Permission.OVERRIDE_STATE);
-                EntryState target;
-                try {
-                    target = EntryState.valueOf(str(p.get("targetState")));
-                } catch (Exception e) {
-                    throw ApiException.unprocessable("Target state is required.");
-                }
-                if (comment.isEmpty()) {
-                    throw ApiException.unprocessable("Emergency overrides require a mandatory reason (SRS §5.2).");
-                }
-                transition(sub, target, principal.getId(), role.name(), "EMERGENCY OVERRIDE: " + comment);
-                if (target == EntryState.VALIDATED) {
-                    sub.setValidatedBy(principal.getId());
-                    sub.setValidatedAt(Instant.now());
-                    sub.setRewardEligible(false);
-                }
-                if (target == EntryState.REJECTED) {
-                    sub.setRejectionReason(comment);
-                }
-                submissionRepository.save(sub);
-                yield okState(sub);
-            }
-            case "assign" -> {
-                requirePerm(role, Permission.ASSIGN_ENTRIES);
-                String assignTo = blankToNull(str(p.get("assignTo")));
-                sub.setAssignedTo(assignTo);
-                sub.setLastUpdatedBy(principal.getId());
-                sub.setUpdatedAt(Instant.now());
-                submissionRepository.save(sub);
-                auditService.record(principal, "ENTRY_ASSIGNED", AuditTargetType.SUBMISSION, sub.getId(),
-                        "Assigned to " + (assignTo != null ? assignTo : "(unassigned)"));
-                yield Map.of("ok", true);
-            }
-            default -> throw ApiException.unprocessable("Unknown action.");
-        };
+    /** Human-readable names of the fields a resubmission changes. */
+    private List<String> changedFields(Submission sub, EntryInput in) {
+        List<String> out = new ArrayList<>();
+        if (!java.util.Objects.equals(sub.getWrittenForm(), in.word())) {
+            out.add("word");
+        }
+        if (sub.getPartOfSpeech() != in.pos()) {
+            out.add("part of speech");
+        }
+        if (sub.getSynsetAction() != in.action()
+                || !java.util.Objects.equals(sub.getSynsetId(), in.synsetId())
+                || !java.util.Objects.equals(sub.getIliCode(), in.iliCode())) {
+            out.add("synset linkage");
+        }
+        if (!java.util.Objects.equals(sub.getDefinitionText(), in.definitionText())
+                || (in.definitionText() != null && sub.getDefinitionLanguage() != in.definitionLanguage())) {
+            out.add("definition");
+        }
+        if (!new java.util.HashSet<>(readSense(sub.getSenseRelationsJson()))
+                .equals(new java.util.HashSet<>(in.senseRelations()))) {
+            out.add("sense relations");
+        }
+        if (!new java.util.HashSet<>(readSynset(sub.getSynsetRelationsJson()))
+                .equals(new java.util.HashSet<>(in.synsetRelations()))) {
+            out.add("synset relations");
+        }
+        if (!java.util.Objects.equals(sub.getReviewerNote(), in.reviewerNote())) {
+            out.add("reviewer note");
+        }
+        return out;
     }
 
     @Transactional
@@ -520,6 +722,7 @@ public class SubmissionService {
         m.put("rejectionReason", s.getRejectionReason());
         m.put("validatedBy", s.getValidatedBy());
         m.put("validatedAt", s.getValidatedAt() != null ? s.getValidatedAt().toString() : null);
+        m.put("version", s.getVersion());
         List<Map<String, Object>> history = new ArrayList<>();
         for (StateTransition t : transitions) {
             Map<String, Object> h = new LinkedHashMap<>();
