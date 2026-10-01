@@ -1,60 +1,48 @@
 package com.bengalilkc.service.export;
 
-import com.bengalilkc.common.SenseRelationPayload;
-import com.bengalilkc.common.SynsetRelationPayload;
 import com.bengalilkc.common.exception.ApiException;
 import com.bengalilkc.domain.entity.admin.ExportRecord;
-import com.bengalilkc.domain.entity.lexicon.LexicalEntryEntity;
 import com.bengalilkc.domain.entity.lexicon.Lexicon;
-import com.bengalilkc.domain.entity.lexicon.SenseEntity;
-import com.bengalilkc.domain.entity.lexicon.SynsetEntity;
-import com.bengalilkc.domain.entity.lexicon.SynsetRelationEntity;
-import com.bengalilkc.domain.entity.workflow.Submission;
 import com.bengalilkc.domain.enums.AuditTargetType;
-import com.bengalilkc.domain.enums.EntryState;
 import com.bengalilkc.domain.enums.PartOfSpeech;
-import com.bengalilkc.domain.enums.SynsetAction;
 import com.bengalilkc.repository.admin.ExportRecordRepository;
-import com.bengalilkc.repository.lexicon.LexicalEntryRepository;
 import com.bengalilkc.repository.lexicon.LexiconRepository;
-import com.bengalilkc.repository.lexicon.SenseRepository;
-import com.bengalilkc.repository.lexicon.SynsetRelationRepository;
-import com.bengalilkc.repository.lexicon.SynsetRepository;
-import com.bengalilkc.repository.workflow.SubmissionRepository;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.IdGeneratorService;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import lombok.RequiredArgsConstructor;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+/**
+ * LMF XML export straight from the lexicon tables. Validated submissions are promoted into
+ * those tables (origin USER), so they are exported with their stored ids; {@code origin}
+ * selects XML-imported data, new user data, or both.
+ */
 @Service
 @RequiredArgsConstructor
 public class ExportService {
 
     private final LexiconRepository lexiconRepository;
-    private final LexicalEntryRepository entryRepository;
-    private final SenseRepository senseRepository;
-    private final SynsetRepository synsetRepository;
-    private final SynsetRelationRepository synsetRelationRepository;
-    private final SubmissionRepository submissionRepository;
     private final ExportRecordRepository exportRecordRepository;
     private final IdGeneratorService idGeneratorService;
     private final AuditService auditService;
-    private final ObjectMapper objectMapper;
+    private final NamedParameterJdbcTemplate jdbc;
+
+    private record SenseRow(String senseId, String entryId, String writtenForm, String pos, String synsetId) {}
 
     @Transactional
     public Object export(UserPrincipal principal, Map<String, String> params) {
@@ -71,46 +59,45 @@ public class ExportService {
                 }
             }
         }
-        boolean includeCanonical = !"0".equals(params.get("canonical"));
+        String origin = params.getOrDefault("origin", "0".equals(params.get("canonical")) ? "user" : "all").toLowerCase();
+        if (!List.of("all", "xml", "user").contains(origin)) {
+            throw ApiException.badRequest("origin must be all, xml or user.");
+        }
         boolean includeLkcSource = "1".equals(params.get("lkcSource"));
 
-        List<Submission> validatedSubs = submissionRepository.findByState(EntryState.VALIDATED).stream()
-                .filter(s -> posFilter.isEmpty() || posFilter.contains(s.getPartOfSpeech()))
-                .toList();
-        List<LexicalEntryEntity> canonicalEntries = includeCanonical
-                ? entryRepository.findAll().stream()
-                        .filter(e -> !e.isCrowdsourced())
-                        .filter(e -> posFilter.isEmpty() || posFilter.contains(e.getPartOfSpeech()))
-                        .toList()
-                : List.of();
+        StringBuilder where = new StringBuilder(" where 1 = 1");
+        MapSqlParameterSource args = new MapSqlParameterSource();
+        if (!posFilter.isEmpty()) {
+            where.append(" and e.part_of_speech in (:pos)");
+            args.addValue("pos", posFilter.stream().map(PartOfSpeech::getCode).toList());
+        }
+        if (!"all".equals(origin)) {
+            where.append(" and s.origin = :origin");
+            args.addValue("origin", origin.toUpperCase());
+        }
+        List<SenseRow> senses = jdbc.query("""
+                select s.id as sense_id, e.id as entry_id, e.written_form, e.part_of_speech, s.synset_id
+                from sense s join lexical_entry e on e.id = s.lexical_entry_id
+                """ + where + " order by e.id, s.id", args,
+                (rs, i) -> new SenseRow(rs.getString("sense_id"), rs.getString("entry_id"),
+                        rs.getString("written_form"), rs.getString("part_of_speech"), rs.getString("synset_id")));
 
-        long nextSynNum = 2_100_000L;
-        long nextSenNum = 3_300_000L;
-        long nextWordNum = 2_300_000L;
-        Map<String, String> newSynsetBySub = new HashMap<>();
-        for (Submission s : validatedSubs) {
-            if (s.getSynsetAction() == SynsetAction.CREATE && s.getIliCode() != null) {
-                newSynsetBySub.put(s.getId(), "ben-syn" + (nextSynNum++));
-            }
+        Map<String, List<SenseRow>> byEntry = new LinkedHashMap<>();
+        Set<String> senseIds = new HashSet<>();
+        Set<String> synsetIds = new java.util.TreeSet<>();
+        for (SenseRow r : senses) {
+            byEntry.computeIfAbsent(r.entryId(), k -> new ArrayList<>()).add(r);
+            senseIds.add(r.senseId());
+            synsetIds.add(r.synsetId());
         }
-
-        Set<String> usedSynsetIds = new HashSet<>();
-        for (LexicalEntryEntity e : canonicalEntries) {
-            for (SenseEntity sn : senseRepository.findByLexicalEntryId(e.getId())) {
-                usedSynsetIds.add(sn.getSynset().getId());
-            }
-        }
-        for (Submission s : validatedSubs) {
-            usedSynsetIds.add(s.getSynsetAction() == SynsetAction.LINK
-                    ? s.getSynsetId()
-                    : newSynsetBySub.get(s.getId()));
-        }
+        long userSenses = senses.isEmpty() ? 0 : jdbc.queryForObject(
+                "select count(*) from sense s join lexical_entry e on e.id = s.lexical_entry_id"
+                        + where + " and s.origin = 'USER'", args, Long.class);
 
         Map<String, Object> stats = new LinkedHashMap<>();
-        stats.put("entries", canonicalEntries.size() + validatedSubs.size());
-        stats.put("crowdsourced", validatedSubs.size());
-        long knownSynsets = usedSynsetIds.stream().filter(id -> id != null && synsetRepository.existsById(id)).count();
-        stats.put("synsets", knownSynsets + newSynsetBySub.size());
+        stats.put("entries", byEntry.size());
+        stats.put("crowdsourced", userSenses);
+        stats.put("synsets", synsetIds.size());
 
         if (dryRun) {
             Map<String, Object> body = new LinkedHashMap<>();
@@ -119,9 +106,24 @@ public class ExportService {
             body.put("config", Map.of(
                     "version", version,
                     "posFilter", posFilter.stream().map(PartOfSpeech::getCode).toList(),
-                    "includeCanonical", includeCanonical,
+                    "origin", origin,
                     "includeLkcSource", includeLkcSource));
             return body;
+        }
+
+        Map<String, List<String[]>> senseRels = new TreeMap<>();
+        if (!senseIds.isEmpty()) {
+            jdbc.query("""
+                    select r.sense_id_1, t.relation_name, r.sense_id_2
+                    from sense_relation r join sense_relation_type t on t.id = r.relation_type_id
+                    order by r.sense_id_1, t.relation_name, r.sense_id_2
+                    """, (org.springframework.jdbc.core.RowCallbackHandler) rs -> {
+                String src = rs.getString(1);
+                String target = rs.getString(3);
+                if (senseIds.contains(src) && senseIds.contains(target)) {
+                    senseRels.computeIfAbsent(src, k -> new ArrayList<>()).add(new String[] {rs.getString(2), target});
+                }
+            });
         }
 
         Lexicon meta = lexiconRepository.findById("livelanguage-ben")
@@ -145,81 +147,63 @@ public class ExportService {
                 .append("\" dc:publisher=\"").append(esc(nullToEmpty(meta.getDcPublisher())))
                 .append("\">\n");
 
-        for (LexicalEntryEntity e : canonicalEntries) {
-            writeCanonicalEntry(xml, e);
-        }
-
-        long wordCursor = nextWordNum;
-        long senCursor = nextSenNum;
-        for (Submission s : validatedSubs) {
-            String wordId = "ben-word-" + s.getPartOfSpeech().getCode() + (wordCursor++);
-            String senseId = "ben-sen" + (senCursor++);
-            String synId = s.getSynsetAction() == SynsetAction.LINK ? s.getSynsetId() : newSynsetBySub.get(s.getId());
-            xml.append("    <LexicalEntry id=\"").append(wordId).append("\">\n");
-            xml.append("      <Lemma writtenForm=\"").append(esc(s.getWrittenForm()))
-                    .append("\" partOfSpeech=\"").append(s.getPartOfSpeech().getCode()).append("\"></Lemma>\n");
-            List<SenseRelationPayload> senseRels = readSense(s.getSenseRelationsJson());
-            if (!senseRels.isEmpty()) {
-                xml.append("      <Sense id=\"").append(senseId).append("\" synset=\"").append(synId).append("\">\n");
-                for (SenseRelationPayload r : senseRels) {
-                    xml.append("        <SenseRelation relType=\"").append(esc(r.relType()))
-                            .append("\" target=\"").append(esc(r.target())).append("\"></SenseRelation>\n");
+        for (List<SenseRow> rows : byEntry.values()) {
+            SenseRow first = rows.get(0);
+            xml.append("    <LexicalEntry id=\"").append(esc(first.entryId())).append("\">\n");
+            xml.append("      <Lemma writtenForm=\"").append(esc(first.writtenForm()))
+                    .append("\" partOfSpeech=\"").append(first.pos()).append("\"></Lemma>\n");
+            for (SenseRow r : rows) {
+                List<String[]> rels = senseRels.getOrDefault(r.senseId(), List.of());
+                xml.append("      <Sense id=\"").append(esc(r.senseId())).append("\" synset=\"")
+                        .append(esc(r.synsetId())).append("\">");
+                if (rels.isEmpty()) {
+                    xml.append("</Sense>\n");
+                    continue;
+                }
+                xml.append("\n");
+                for (String[] rel : rels) {
+                    xml.append("        <SenseRelation relType=\"").append(esc(rel[0]))
+                            .append("\" target=\"").append(esc(rel[1])).append("\"></SenseRelation>\n");
                 }
                 xml.append("      </Sense>\n");
-            } else {
-                xml.append("      <Sense id=\"").append(senseId).append("\" synset=\"").append(synId)
-                        .append("\"></Sense>\n");
             }
             xml.append("    </LexicalEntry>\n");
         }
 
-        for (String id : usedSynsetIds) {
-            if (id == null) {
-                continue;
-            }
-            SynsetEntity syn = synsetRepository.findById(id).orElse(null);
-            if (syn == null) {
-                continue;
-            }
-            xml.append("    <Synset id=\"").append(syn.getId()).append("\" ili=\"").append(esc(syn.getIli()))
-                    .append("\" partOfSpeech=\"").append(syn.getPartOfSpeech().getCode())
-                    .append("\" lexicalized=\"").append(syn.isLexicalized()).append("\">\n");
-            if (syn.getDefinitionText() != null) {
-                xml.append("      <Definition language=\"")
-                        .append(syn.getDefinitionLanguage() != null ? syn.getDefinitionLanguage().getCode() : "ben")
-                        .append("\">").append(esc(syn.getDefinitionText())).append("</Definition>\n");
-            }
-            for (SynsetRelationEntity r : synsetRelationRepository.findBySourceSynsetId(syn.getId())) {
-                if (!usedSynsetIds.contains(r.getTargetSynset().getId())) {
-                    continue;
+        if (!synsetIds.isEmpty()) {
+            Map<String, List<String[]>> synRels = new TreeMap<>();
+            jdbc.query("""
+                    select r.source_synset_id, t.relation_name, r.target_synset_id
+                    from synset_relation r join synset_relation_type t on t.id = r.relation_type_id
+                    order by r.source_synset_id, t.relation_name, r.target_synset_id
+                    """, (org.springframework.jdbc.core.RowCallbackHandler) rs -> {
+                String src = rs.getString(1);
+                String target = rs.getString(3);
+                if (synsetIds.contains(src) && synsetIds.contains(target)) {
+                    synRels.computeIfAbsent(src, k -> new ArrayList<>()).add(new String[] {rs.getString(2), target});
                 }
-                xml.append("      <SynsetRelation relType=\"").append(esc(r.getRelationType().getRelationName()))
-                        .append("\" target=\"").append(r.getTargetSynset().getId()).append("\"></SynsetRelation>\n");
-            }
-            xml.append("    </Synset>\n");
-        }
-
-        for (Submission s : validatedSubs) {
-            String newId = newSynsetBySub.get(s.getId());
-            if (newId == null) {
-                continue;
-            }
-            xml.append("    <Synset id=\"").append(newId).append("\" ili=\"").append(esc(s.getIliCode()))
-                    .append("\" partOfSpeech=\"").append(s.getPartOfSpeech().getCode())
-                    .append("\" lexicalized=\"true\">\n");
-            if (s.getDefinitionText() != null) {
-                xml.append("      <Definition language=\"")
-                        .append(s.getDefinitionLanguage() != null ? s.getDefinitionLanguage().getCode() : "ben")
-                        .append("\">").append(esc(s.getDefinitionText())).append("</Definition>\n");
-            }
-            for (SynsetRelationPayload r : readSynset(s.getSynsetRelationsJson())) {
-                if (!usedSynsetIds.contains(r.target())) {
-                    continue;
+            });
+            jdbc.query("""
+                    select id, ili, part_of_speech, lexicalized, definition_language, definition_text
+                    from synset where id in (:ids) order by id
+                    """, new MapSqlParameterSource("ids", List.copyOf(synsetIds)),
+                    (org.springframework.jdbc.core.RowCallbackHandler) rs -> {
+                String id = rs.getString("id");
+                xml.append("    <Synset id=\"").append(esc(id)).append("\" ili=\"").append(esc(rs.getString("ili")))
+                        .append("\" partOfSpeech=\"").append(rs.getString("part_of_speech"))
+                        .append("\" lexicalized=\"").append(rs.getBoolean("lexicalized")).append("\">\n");
+                String def = rs.getString("definition_text");
+                if (def != null) {
+                    String lang = rs.getString("definition_language");
+                    xml.append("      <Definition language=\"").append(lang != null ? lang : "ben")
+                            .append("\">").append(esc(def)).append("</Definition>\n");
                 }
-                xml.append("      <SynsetRelation relType=\"").append(esc(r.relType()))
-                        .append("\" target=\"").append(esc(r.target())).append("\"></SynsetRelation>\n");
-            }
-            xml.append("    </Synset>\n");
+                for (String[] rel : synRels.getOrDefault(id, List.of())) {
+                    xml.append("      <SynsetRelation relType=\"").append(esc(rel[0]))
+                            .append("\" target=\"").append(esc(rel[1])).append("\"></SynsetRelation>\n");
+                }
+                xml.append("    </Synset>\n");
+            });
         }
 
         xml.append("  </Lexicon>\n</LexicalResource>");
@@ -231,51 +215,18 @@ public class ExportService {
                 .id(exportId)
                 .timestamp(Instant.now())
                 .actorId(principal.getId())
-                .entryCount((int) stats.get("entries"))
-                .synsetCount((int) stats.get("synsets"))
+                .entryCount(byEntry.size())
+                .synsetCount(synsetIds.size())
                 .sha256(sha256)
                 .configJson("version=" + version + "; pos="
                         + (posFilter.isEmpty() ? "all" : String.join("/", posFilter.stream().map(PartOfSpeech::getCode).toList()))
-                        + "; canonical=" + includeCanonical)
+                        + "; origin=" + origin)
                 .build());
         auditService.record(principal, "EXPORT_GENERATED", AuditTargetType.EXPORT, exportId,
-                stats.get("entries") + " entries, " + stats.get("synsets") + " synsets, SHA-256 "
+                byEntry.size() + " entries, " + synsetIds.size() + " synsets (" + origin + "), SHA-256 "
                         + sha256.substring(0, 12) + "…");
 
         return Map.of("xml", xmlStr, "sha256", sha256, "version", version);
-    }
-
-    private void writeCanonicalEntry(StringBuilder xml, LexicalEntryEntity e) {
-        xml.append("    <LexicalEntry id=\"").append(e.getId()).append("\">\n");
-        xml.append("      <Lemma writtenForm=\"").append(esc(e.getWrittenForm()))
-                .append("\" partOfSpeech=\"").append(e.getPartOfSpeech().getCode()).append("\"></Lemma>\n");
-        for (SenseEntity sn : senseRepository.findByLexicalEntryId(e.getId())) {
-            xml.append("      <Sense id=\"").append(sn.getId()).append("\" synset=\"")
-                    .append(sn.getSynset().getId()).append("\"></Sense>\n");
-        }
-        xml.append("    </LexicalEntry>\n");
-    }
-
-    private List<SenseRelationPayload> readSense(String json) {
-        try {
-            if (json == null || json.isBlank()) {
-                return List.of();
-            }
-            return objectMapper.readValue(json, new TypeReference<>() {});
-        } catch (Exception e) {
-            return List.of();
-        }
-    }
-
-    private List<SynsetRelationPayload> readSynset(String json) {
-        try {
-            if (json == null || json.isBlank()) {
-                return List.of();
-            }
-            return objectMapper.readValue(json, new TypeReference<>() {});
-        } catch (Exception e) {
-            return List.of();
-        }
     }
 
     private static String sha256(String xml) {
@@ -288,6 +239,9 @@ public class ExportService {
     }
 
     private static String esc(String s) {
+        if (s == null) {
+            return "";
+        }
         return s.replace("&", "&amp;")
                 .replace("<", "&lt;")
                 .replace(">", "&gt;")

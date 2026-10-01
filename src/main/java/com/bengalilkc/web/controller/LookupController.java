@@ -45,11 +45,10 @@ public class LookupController {
         return lexiconQueryService.lookupIli(word, pos);
     }
 
-    /** Live Quick Input validation: writtenForm + POS + synset/ILI linkage. */
+    /** Live Quick Input validation — the same rules enforced when the entry is saved. */
     @PostMapping("/validate")
     public Map<String, Object> validate(@RequestBody Map<String, Object> body) {
-        SecurityUtils.requirePrincipal();
-        return lexiconValidationService.validateEntry(body);
+        return lexiconValidationService.validateEntry(body, SecurityUtils.requirePrincipal().getId());
     }
 
     @GetMapping("/validate/ili")

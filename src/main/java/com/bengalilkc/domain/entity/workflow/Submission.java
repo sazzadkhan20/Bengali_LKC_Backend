@@ -40,8 +40,13 @@ public class Submission {
     @Column(name = "contributor_id", nullable = false, length = 64)
     private String contributorId;
 
+    /** Assigned Lexical Editor (Pending Review stage). */
     @Column(name = "assigned_to", length = 64)
     private String assignedTo;
+
+    /** Assigned Chief Lexical Editor (Editor Approved stage). */
+    @Column(name = "assigned_chief", length = 64)
+    private String assignedChief;
 
     @Column(name = "written_form", nullable = false, columnDefinition = "TEXT")
     private String writtenForm;

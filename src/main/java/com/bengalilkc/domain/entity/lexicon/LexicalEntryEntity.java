@@ -46,6 +46,10 @@ public class LexicalEntryEntity {
     @Builder.Default
     private boolean crowdsourced = false;
 
+    /** Database-generated comparison key ({@code lkc_form_key(written_form)}). */
+    @Column(name = "form_key", insertable = false, updatable = false, columnDefinition = "TEXT")
+    private String formKey;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 

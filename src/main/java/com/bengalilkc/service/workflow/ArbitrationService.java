@@ -100,6 +100,39 @@ public class ArbitrationService {
         return body;
     }
 
+    /** Emergency override into ARBITRATION: opens a real case (override reason as its note) and moves the entry. */
+    @Transactional
+    public String openByOverride(UserPrincipal principal, Submission sub, String reason) {
+        String caseId = createCase(sub, principal.getId(), sub.getContributorId(), DisputeType.ESCALATION, reason, sub.getState());
+        submissionService.transition(sub, EntryState.ARBITRATION, principal.getId(), principal.getRole().name(),
+                "EMERGENCY OVERRIDE: " + reason);
+        auditService.record(principal, "CASE_OPENED", AuditTargetType.ARBITRATION, caseId,
+                "Opened by emergency override for \"" + sub.getWrittenForm() + "\" — contributor has 72 hours to respond");
+        return caseId;
+    }
+
+    /** Emergency override out of ARBITRATION: every open case of the entry is closed so curators can no longer vote. */
+    @Transactional
+    public List<String> closeByOverride(UserPrincipal principal, Submission sub, EntryState target, String reason) {
+        String who = principal.getRole() == Role.PLATFORM_ARCHITECT ? "Platform Architect" : "System Moderator";
+        List<String> closed = new java.util.ArrayList<>();
+        for (ArbitrationCase c : caseRepository.findBySubmissionId(sub.getId())) {
+            if (c.getStatus() == ArbitrationStatus.RESOLVED) {
+                continue;
+            }
+            c.setStatus(ArbitrationStatus.RESOLVED);
+            c.setVerdictBy(VerdictBy.EMERGENCY_OVERRIDE);
+            c.setResolvedAt(Instant.now());
+            c.setResolutionNote("Closed by emergency override: the " + who + " moved the entry to "
+                    + target.name() + ". Reason: " + reason);
+            caseRepository.save(c);
+            auditService.record(principal, "CASE_CLOSED_BY_OVERRIDE", AuditTargetType.ARBITRATION, c.getId(),
+                    "Entry moved to " + target.name() + " by emergency override");
+            closed.add(c.getId());
+        }
+        return closed;
+    }
+
     @Transactional
     public Map<String, Object> openDispute(UserPrincipal principal, Submission sub, String comment) {
         if (!sub.getContributorId().equals(principal.getId())
@@ -406,6 +439,7 @@ public class ArbitrationService {
         m.put("resolvedAt", c.getResolvedAt() != null ? c.getResolvedAt().toString() : null);
         m.put("correctionApplied", c.isCorrectionApplied());
         m.put("correctionNote", c.getCorrectionNote());
+        m.put("resolutionNote", c.getResolutionNote());
         return m;
     }
 

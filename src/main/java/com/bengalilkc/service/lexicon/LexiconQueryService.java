@@ -1,5 +1,6 @@
 package com.bengalilkc.service.lexicon;
 
+import com.bengalilkc.common.BengaliText;
 import com.bengalilkc.common.exception.ApiException;
 import com.bengalilkc.domain.entity.lexicon.LexicalEntryEntity;
 import com.bengalilkc.domain.entity.lexicon.SenseEntity;
@@ -20,6 +21,8 @@ import java.util.Map;
 import java.util.Set;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -34,6 +37,7 @@ public class LexiconQueryService {
     private final SenseRepository senseRepository;
     private final SynsetRelationRepository synsetRelationRepository;
     private final WordnetIliRepository wordnetIliRepository;
+    private final NamedParameterJdbcTemplate jdbc;
 
     /** count(*) scans the whole table in PostgreSQL, so corpus sizes are cached briefly. */
     private static final long COUNTS_TTL_MS = 60_000;
@@ -69,8 +73,12 @@ public class LexiconQueryService {
         }
         PartOfSpeech pos = parsePos(posParam);
         List<Map<String, Object>> results = new ArrayList<>();
+        String prefix = BengaliText.key(q);
+        if (prefix.isEmpty()) {
+            return Map.of("results", List.of());
+        }
         List<SenseEntity> senses = senseRepository.findForWordLookup(
-                q.trim(), pos, PageRequest.of(0, LOOKUP_LIMIT));
+                prefix, pos, PageRequest.of(0, LOOKUP_LIMIT));
         for (SenseEntity s : senses) {
             LexicalEntryEntity e = s.getLexicalEntry();
             SynsetEntity syn = s.getSynset();
@@ -80,6 +88,7 @@ public class LexiconQueryService {
             row.put("lemma", e.getWrittenForm());
             row.put("pos", e.getPartOfSpeech().getCode());
             row.put("definition", truncate(syn.getDefinitionText(), 90));
+            row.put("origin", s.getOrigin() != null ? s.getOrigin() : "XML");
             results.add(row);
         }
         return Map.of("results", results);
@@ -108,7 +117,8 @@ public class LexiconQueryService {
             return Map.of("results", synsetRows(found.values()));
         }
 
-        for (SenseEntity s : senseRepository.findForWordLookup(query, pos, PageRequest.of(0, LOOKUP_LIMIT * 2))) {
+        for (SenseEntity s : senseRepository.findForWordLookup(
+                BengaliText.key(query), pos, PageRequest.of(0, LOOKUP_LIMIT * 2))) {
             found.putIfAbsent(s.getSynset().getId(), s.getSynset());
             if (found.size() >= LOOKUP_LIMIT) {
                 break;
@@ -147,6 +157,17 @@ public class LexiconQueryService {
                 ? Set.of()
                 : new java.util.HashSet<>(synsetRepository.findExistingIlis(
                         hits.stream().map(WordnetIli::getIli).toList()));
+        Map<String, String> proposedIn = new java.util.HashMap<>();
+        if (!hits.isEmpty()) {
+            jdbc.query("""
+                    select lower(ili_code) as ili, min(id) as id from submission
+                    where synset_action = 'create' and state <> 'REJECTED' and promoted_synset_id is null
+                      and lower(ili_code) in (:ilis)
+                    group by lower(ili_code)
+                    """,
+                    new MapSqlParameterSource("ilis", hits.stream().map(h -> h.getIli().toLowerCase()).toList()),
+                    (org.springframework.jdbc.core.RowCallbackHandler) rs -> proposedIn.put(rs.getString("ili"), rs.getString("id")));
+        }
         List<Map<String, Object>> results = new ArrayList<>();
         for (WordnetIli w : hits) {
             Map<String, Object> row = new LinkedHashMap<>();
@@ -157,6 +178,7 @@ public class LexiconQueryService {
             boolean mapped = mappedIlis.contains(w.getIli());
             row.put("alreadyMapped", mapped);
             row.put("alreadyInBengali", mapped);
+            row.put("proposedIn", proposedIn.get(w.getIli().toLowerCase()));
             results.add(row);
         }
         return Map.of("results", results, "registry", registry);
@@ -251,6 +273,7 @@ public class LexiconQueryService {
             row.put("pos", syn.getPartOfSpeech().getCode());
             row.put("definition", truncate(syn.getDefinitionText(), 110));
             row.put("words", List.copyOf(wordsBySynset.getOrDefault(syn.getId(), Set.of())));
+            row.put("origin", syn.getOrigin() != null ? syn.getOrigin() : "XML");
             rows.add(row);
         }
         return rows;
