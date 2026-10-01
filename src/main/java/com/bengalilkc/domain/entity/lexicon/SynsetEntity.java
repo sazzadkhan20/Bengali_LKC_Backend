@@ -58,6 +58,10 @@ public class SynsetEntity {
     @Builder.Default
     private boolean crowdsourced = false;
 
+    /** XML (imported) or USER (promoted from a validated submission); written only by the database/promotion. */
+    @Column(name = "origin", insertable = false, updatable = false, length = 10)
+    private String origin;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 

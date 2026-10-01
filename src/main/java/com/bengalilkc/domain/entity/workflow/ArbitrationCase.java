@@ -87,6 +87,9 @@ public class ArbitrationCase {
     @Column(name = "correction_note", columnDefinition = "TEXT")
     private String correctionNote;
 
+    @Column(name = "resolution_note", columnDefinition = "TEXT")
+    private String resolutionNote;
+
     @Enumerated(EnumType.STRING)
     @Column(name = "pre_arbitration_state", length = 40)
     private EntryState preArbitrationState;

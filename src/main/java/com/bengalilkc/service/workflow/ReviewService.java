@@ -168,18 +168,19 @@ public class ReviewService {
     }
 
     /**
-     * Name of another reviewer of the caller's own role holding the assignment, else null.
-     * An assignment left over from an earlier stage (e.g. the Lexical Editor once the entry
-     * reaches the Chief's queue) does not lock the entry.
+     * Name of the other reviewer holding the caller's stage slot (Lexical Editor → assigned_to,
+     * Chief Lexical Editor → assigned_chief), else null. Only the assignee may review at that stage.
      */
     private String otherAssignee(UserPrincipal principal, Submission sub) {
-        if (sub.getAssignedTo() == null || sub.getAssignedTo().equals(principal.getId())) {
+        String assigned = switch (principal.getRole()) {
+            case LEXICAL_EDITOR -> sub.getAssignedTo();
+            case CHIEF_LEXICAL_EDITOR -> sub.getAssignedChief();
+            default -> null;
+        };
+        if (assigned == null || assigned.equals(principal.getId())) {
             return null;
         }
-        return userRepository.findById(sub.getAssignedTo())
-                .filter(u -> u.getRole() == principal.getRole())
-                .map(AppUser::getName)
-                .orElse(null);
+        return userRepository.findById(assigned).map(AppUser::getName).orElse(assigned);
     }
 
     private static String validateComment(Rule rule, String comment) {

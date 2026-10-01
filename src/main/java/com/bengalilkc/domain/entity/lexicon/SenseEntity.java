@@ -43,6 +43,10 @@ public class SenseEntity {
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
+    /** XML (imported) or USER (promoted from a validated submission); written only by the database/promotion. */
+    @Column(name = "origin", insertable = false, updatable = false, length = 10)
+    private String origin;
+
     @OneToMany(mappedBy = "sourceSense", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
     @Builder.Default
     private List<SenseRelationEntity> relations = new ArrayList<>();

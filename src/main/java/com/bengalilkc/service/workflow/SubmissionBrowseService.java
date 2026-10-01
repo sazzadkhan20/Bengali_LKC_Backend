@@ -79,13 +79,18 @@ public class SubmissionBrowseService {
         if (!isOwner && !reviewer) {
             throw ApiException.forbidden("You can only view your own submissions.");
         }
+        String hidden = isOwner ? null : assignedElsewhere(principal, sub);
+        if (hidden != null) {
+            throw ApiException.forbidden(hidden);
+        }
 
         Map<String, Object> m = new LinkedHashMap<>(submissionService.toDto(sub));
 
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> history = (List<Map<String, Object>>) m.get("history");
         Set<String> userIds = new HashSet<>();
-        Stream.of(sub.getContributorId(), sub.getAssignedTo(), sub.getValidatedBy(), sub.getLastUpdatedBy())
+        Stream.of(sub.getContributorId(), sub.getAssignedTo(), sub.getAssignedChief(), sub.getValidatedBy(),
+                        sub.getLastUpdatedBy())
                 .filter(Objects::nonNull)
                 .forEach(userIds::add);
         history.stream().map(h -> (String) h.get("actorId")).filter(Objects::nonNull).forEach(userIds::add);
@@ -151,6 +156,7 @@ public class SubmissionBrowseService {
         if (ownerActions != null) {
             m.put("ownerActions", ownerActions);
         }
+        m.put("lifecycle", submissionService.lifecycle(principal, sub));
         ArbitrationCase activeCase = sub.getState() == EntryState.ARBITRATION
                 ? cases.stream()
                         .filter(c -> c.getStatus() != ArbitrationStatus.RESOLVED)
@@ -327,11 +333,12 @@ public class SubmissionBrowseService {
             where.append(" and s.state = :state");
             params.addValue("state", state.name());
         }
-        if ("unassigned".equals(assignedTo)) {
-            where.append(" and s.assigned_to is null");
-        } else if (assignedTo != null) {
-            where.append(" and s.assigned_to = :assignedTo");
-            params.addValue("assignedTo", assignedTo);
+        // Each reviewer role has its own slot; managers filter across both.
+        String slot = reviewerSlotColumn(role);
+        if (slot != null) {
+            // An entry assigned to another reviewer of the same role is theirs alone.
+            where.append(" and (").append(slot).append(" is null or ").append(slot).append(" = :me)");
+            params.addValue("me", me);
         }
         if (contributorId != null) {
             where.append(" and s.contributor_id = :contributorId");
@@ -344,6 +351,24 @@ public class SubmissionBrowseService {
                     .append(" or s.synset_id in (select sy.id from synset sy")
                     .append(" where lower(sy.definition_text) like :like escape '!'))");
             params.addValue("like", "%" + escapeLike(q.toLowerCase(Locale.ROOT)) + "%");
+        }
+
+        Map<String, Object> scopeCounts = null;
+        if (slot != null) {
+            Map<String, Object> counts = jdbc.queryForMap("select count(*) as available, count(*) filter (where "
+                    + slot + " = :me) as mine from submission s" + where, params);
+            scopeCounts = new LinkedHashMap<>();
+            scopeCounts.put("available", ((Number) counts.get("available")).longValue());
+            scopeCounts.put("assignedToMe", ((Number) counts.get("mine")).longValue());
+        }
+
+        if ("unassigned".equals(assignedTo)) {
+            where.append(slot != null ? " and " + slot + " is null"
+                    : " and s.assigned_to is null and s.assigned_chief is null");
+        } else if (assignedTo != null) {
+            where.append(slot != null ? " and " + slot + " = :assignedTo"
+                    : " and (s.assigned_to = :assignedTo or s.assigned_chief = :assignedTo)");
+            params.addValue("assignedTo", assignedTo);
         }
 
         Map<String, Object> agg = jdbc.queryForMap(
@@ -360,12 +385,14 @@ public class SubmissionBrowseService {
                            s.ili_code, s.definition_text, sy.definition_text as synset_definition,
                            s.contributor_id, cu.name as contributor_name,
                            s.assigned_to, au.name as assigned_to_name,
+                           s.assigned_chief, ac.name as assigned_chief_name,
                            s.last_updated_by, lu.name as last_updated_by_name,
                            s.created_at, s.updated_at
                     from submission s
                     left join synset sy on sy.id = s.synset_id
                     left join app_user cu on cu.id = s.contributor_id
                     left join app_user au on au.id = s.assigned_to
+                    left join app_user ac on ac.id = s.assigned_chief
                     left join app_user lu on lu.id = s.last_updated_by
                     """ + where + " order by s.updated_at desc, s.id desc limit :limit offset :offset",
                     params,
@@ -385,8 +412,46 @@ public class SubmissionBrowseService {
         body.put("totalElements", total);
         body.put("totalPages", (int) ((total + size - 1) / size));
         body.put("lastUpdatedAt", lastUpdated != null ? lastUpdated.toInstant().toString() : null);
+        if (scopeCounts != null) {
+            body.put("scopeCounts", scopeCounts);
+        }
         body.put("filters", filters);
         return body;
+    }
+
+    private static String reviewerSlotColumn(Role role) {
+        return switch (role) {
+            case LEXICAL_EDITOR -> "s.assigned_to";
+            case CHIEF_LEXICAL_EDITOR -> "s.assigned_chief";
+            default -> null;
+        };
+    }
+
+    /**
+     * Error message when the entry sits in the caller's review stage but is assigned to another
+     * reviewer of the same role; such entries are visible only to their assignee (and managers).
+     */
+    private static String assignedElsewhere(UserPrincipal principal, Submission sub) {
+        String assignee;
+        String roleLabel;
+        switch (principal.getRole()) {
+            case LEXICAL_EDITOR -> {
+                if (sub.getState() != EntryState.PENDING_REVIEW) return null;
+                assignee = sub.getAssignedTo();
+                roleLabel = "Lexical Editor";
+            }
+            case CHIEF_LEXICAL_EDITOR -> {
+                if (sub.getState() != EntryState.EDITOR_APPROVED) return null;
+                assignee = sub.getAssignedChief();
+                roleLabel = "Chief Lexical Editor";
+            }
+            default -> {
+                return null;
+            }
+        }
+        if (assignee == null || assignee.equals(principal.getId())) return null;
+        return "This entry is assigned to another " + roleLabel
+                + ". Only the assigned reviewer can open it while it is awaiting review.";
     }
 
     public record HistoryCriteria(String q, String state, Integer page, Integer size) {}
@@ -464,6 +529,7 @@ public class SubmissionBrowseService {
                            s.ili_code, s.definition_text, sy.definition_text as synset_definition,
                            s.contributor_id, cu.name as contributor_name,
                            s.assigned_to, au.name as assigned_to_name,
+                           s.assigned_chief, ac.name as assigned_chief_name,
                            s.last_updated_by, lu.name as last_updated_by_name,
                            s.created_at, s.updated_at
                     from mine m
@@ -471,6 +537,7 @@ public class SubmissionBrowseService {
                     left join synset sy on sy.id = s.synset_id
                     left join app_user cu on cu.id = s.contributor_id
                     left join app_user au on au.id = s.assigned_to
+                    left join app_user ac on ac.id = s.assigned_chief
                     left join app_user lu on lu.id = s.last_updated_by
                     """ + where + " order by m.my_last_at desc, s.id desc limit :limit offset :offset",
                     params,
@@ -508,6 +575,8 @@ public class SubmissionBrowseService {
         m.put("contributorName", rs.getString("contributor_name"));
         m.put("assignedTo", rs.getString("assigned_to"));
         m.put("assignedToName", rs.getString("assigned_to_name"));
+        m.put("assignedChief", rs.getString("assigned_chief"));
+        m.put("assignedChiefName", rs.getString("assigned_chief_name"));
         m.put("lastUpdatedBy", rs.getString("last_updated_by"));
         m.put("lastUpdatedByName", rs.getString("last_updated_by_name"));
         m.put("createdAt", instant(rs.getTimestamp("created_at")));

@@ -33,13 +33,13 @@ public interface SenseRepository extends JpaRepository<SenseEntity, String> {
 
     List<SenseEntity> findByLexicalEntryId(String lexicalEntryId);
 
-    /** Prefix search by lemma for Quick Input autocomplete (sense-rel targets). */
+    /** Prefix search on the normalised form key; pass a prefix built with {@code BengaliText.key}. */
     @Query(
             """
             select s from SenseEntity s
             join fetch s.lexicalEntry e
             join fetch s.synset syn
-            where lower(e.writtenForm) like lower(concat(:prefix, '%'))
+            where e.formKey like concat(:prefix, '%')
               and (:pos is null or e.partOfSpeech = :pos)
             order by e.writtenForm asc
             """)
