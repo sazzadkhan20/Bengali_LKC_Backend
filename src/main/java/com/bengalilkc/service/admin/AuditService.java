@@ -6,7 +6,6 @@ import com.bengalilkc.domain.enums.Role;
 import com.bengalilkc.repository.admin.AuditEventRepository;
 import com.bengalilkc.security.UserPrincipal;
 import java.time.Instant;
-import java.util.List;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -49,30 +48,4 @@ public class AuditService {
         return record("system", "SYSTEM", action, targetType, targetId, detail);
     }
 
-    @Transactional(readOnly = true)
-    public List<AuditEvent> listAll() {
-        return auditEventRepository.findAllByOrderByTimestampDesc();
-    }
-
-    public String toCsv(List<AuditEvent> events) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("id,timestamp,actorId,actorRole,action,targetType,targetId,detail\n");
-        for (AuditEvent e : events) {
-            sb.append(csv(e.getId())).append(',')
-                    .append(csv(e.getTimestamp() != null ? e.getTimestamp().toString() : "")).append(',')
-                    .append(csv(e.getActorId())).append(',')
-                    .append(csv(e.getActorRole())).append(',')
-                    .append(csv(e.getAction())).append(',')
-                    .append(csv(e.getTargetType() != null ? e.getTargetType().name() : "")).append(',')
-                    .append(csv(e.getTargetId())).append(',')
-                    .append(csv(e.getDetail()))
-                    .append('\n');
-        }
-        return sb.toString();
-    }
-
-    private static String csv(String v) {
-        String s = v == null ? "" : v.replace("\"", "\"\"");
-        return "\"" + s + "\"";
-    }
 }

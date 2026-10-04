@@ -1,5 +1,7 @@
 package com.bengalilkc.domain.entity.workflow;
 
+import com.bengalilkc.domain.enums.ArbitrationOrigin;
+import com.bengalilkc.domain.enums.ArbitrationStage;
 import com.bengalilkc.domain.enums.ArbitrationStatus;
 import com.bengalilkc.domain.enums.ArbitrationVerdict;
 import com.bengalilkc.domain.enums.DisputeType;
@@ -93,6 +95,50 @@ public class ArbitrationCase {
     @Enumerated(EnumType.STRING)
     @Column(name = "pre_arbitration_state", length = 40)
     private EntryState preArbitrationState;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 30)
+    private ArbitrationOrigin origin;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private ArbitrationStage stage;
+
+    @Column(name = "contributor_id", nullable = false, length = 64)
+    private String contributorId;
+
+    /** The Lexical Editor / Chief Lexical Editor whose decision is disputed; null if none could be determined. */
+    @Column(name = "reviewer_id", length = 64)
+    private String reviewerId;
+
+    @Column(name = "contributor_note", columnDefinition = "TEXT")
+    private String contributorNote;
+
+    @Column(name = "contributor_note_at")
+    private Instant contributorNoteAt;
+
+    @Column(name = "reviewer_note", columnDefinition = "TEXT")
+    private String reviewerNote;
+
+    @Column(name = "reviewer_note_at")
+    private Instant reviewerNoteAt;
+
+    @Column(name = "window_closed_at")
+    private Instant windowClosedAt;
+
+    @Column(name = "voting_opened_at")
+    private Instant votingOpenedAt;
+
+    @Column(name = "voting_deadline")
+    private Instant votingDeadline;
+
+    @Column(name = "voting_extensions", nullable = false)
+    @Builder.Default
+    private int votingExtensions = 0;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "resulting_state", length = 40)
+    private EntryState resultingState;
 
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;

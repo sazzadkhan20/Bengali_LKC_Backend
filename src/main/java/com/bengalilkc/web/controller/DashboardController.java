@@ -1,15 +1,16 @@
 package com.bengalilkc.web.controller;
 
+import com.bengalilkc.common.exception.ApiException;
 import com.bengalilkc.domain.enums.EntryState;
 import com.bengalilkc.domain.enums.Permission;
 import com.bengalilkc.domain.enums.Role;
-import com.bengalilkc.repository.workflow.ArbitrationCaseRepository;
-import com.bengalilkc.repository.workflow.SubmissionRepository;
 import com.bengalilkc.security.PermissionMatrix;
 import com.bengalilkc.security.SecurityUtils;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.community.LeaderboardService;
+import com.bengalilkc.service.dashboard.DashboardService;
 import com.bengalilkc.service.workflow.ArbitrationService;
+import com.bengalilkc.service.workflow.QuotaService;
 import com.bengalilkc.service.workflow.SubmissionService;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,29 +26,38 @@ import org.springframework.web.bind.annotation.RestController;
 @RequiredArgsConstructor
 public class DashboardController {
 
-    private final SubmissionRepository submissionRepository;
-    private final ArbitrationCaseRepository caseRepository;
     private final SubmissionService submissionService;
     private final ArbitrationService arbitrationService;
     private final LeaderboardService leaderboardService;
+    private final DashboardService dashboardService;
+    private final QuotaService quotaService;
+
+    @GetMapping("/me")
+    public Map<String, Object> me() {
+        return dashboardService.forUser(SecurityUtils.requirePrincipal());
+    }
+
+    /** The caller's submission quota usage (session, 24 hours, suspension and anomaly thresholds). */
+    @GetMapping("/quota")
+    public Map<String, Object> quota() {
+        return quotaService.usage(SecurityUtils.requirePrincipal().getId());
+    }
 
     @GetMapping("/stats")
     public Map<String, Object> stats() {
         UserPrincipal principal = SecurityUtils.requirePrincipal();
         if (!PermissionMatrix.has(principal.getRole(), Permission.STATISTICS)) {
-            return Map.of("error", "Not authorised.");
+            throw ApiException.forbidden("You do not have access to platform statistics.");
         }
-        Map<String, Object> m = new LinkedHashMap<>();
-        for (EntryState state : EntryState.values()) {
-            m.put(state.name(), submissionRepository.countByState(state));
-        }
-        m.put("cases", caseRepository.count());
-        return m;
+        return dashboardService.statistics();
     }
 
     @GetMapping("/queues")
     public Map<String, Object> queues() {
-        SecurityUtils.requirePrincipal();
+        UserPrincipal principal = SecurityUtils.requirePrincipal();
+        if (!PermissionMatrix.has(principal.getRole(), Permission.STATISTICS)) {
+            throw ApiException.forbidden("You do not have access to the review queues.");
+        }
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("pendingReview", submissionService.listByState(EntryState.PENDING_REVIEW));
         m.put("editorApproved", submissionService.listByState(EntryState.EDITOR_APPROVED));
@@ -57,14 +67,7 @@ public class DashboardController {
     }
 
     @GetMapping("/leaderboard")
-    public List<Map<String, Object>> leaderboard(@RequestParam(defaultValue = "CONTRIBUTOR") String role) {
-        SecurityUtils.requirePrincipal();
-        Role ranked;
-        try {
-            ranked = Role.valueOf(role);
-        } catch (Exception e) {
-            ranked = Role.CONTRIBUTOR;
-        }
-        return leaderboardService.leaderboardFor(ranked);
+    public Map<String, Object> leaderboard(@RequestParam(required = false) String role) {
+        return leaderboardService.boardFor(SecurityUtils.requirePrincipal(), role);
     }
 }

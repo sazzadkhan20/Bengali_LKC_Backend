@@ -10,6 +10,7 @@ import com.bengalilkc.domain.enums.Role;
 import com.bengalilkc.repository.identity.AppUserRepository;
 import com.bengalilkc.repository.workflow.StateTransitionRepository;
 import com.bengalilkc.repository.workflow.SubmissionRepository;
+import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.admin.ConfigService;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -18,6 +19,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -37,68 +40,102 @@ public class LeaderboardService {
     private final AppUserRepository userRepository;
     private final ConfigService configService;
     private final CommunityService communityService;
+    private final NamedParameterJdbcTemplate jdbc;
 
     public LeaderboardService(
             SubmissionRepository submissionRepository,
             StateTransitionRepository transitionRepository,
             AppUserRepository userRepository,
             ConfigService configService,
-            @Lazy CommunityService communityService) {
+            @Lazy CommunityService communityService,
+            NamedParameterJdbcTemplate jdbc) {
         this.submissionRepository = submissionRepository;
         this.transitionRepository = transitionRepository;
         this.userRepository = userRepository;
         this.configService = configService;
         this.communityService = communityService;
+        this.jdbc = jdbc;
     }
+
+    /**
+     * Validated, reward-eligible entries credited per ranked author. Credit follows the final
+     * validation: a CLE validation credits the contributor, that CLE and the Lexical Editor whose
+     * approval preceded it; a binding panel verdict (actor SYSTEM) credits the contributor only.
+     * Credits only count while the author still holds the credited role.
+     */
+    private static final String CREDITS_SQL = """
+            with last_validation as (
+              select distinct on (t.submission_id) t.submission_id, t.actor_id, t.actor_role, s.contributor_id
+              from state_transition t join submission s on s.id = t.submission_id
+              where s.state = 'VALIDATED' and s.reward_eligible and t.to_state = 'VALIDATED'
+              order by t.submission_id, t.created_at desc, t.id desc
+            ), last_approval as (
+              select distinct on (t.submission_id) t.submission_id, t.actor_id
+              from state_transition t join last_validation v on v.submission_id = t.submission_id
+              where t.to_state = 'EDITOR_APPROVED' and v.actor_role = 'CHIEF_LEXICAL_EDITOR'
+              order by t.submission_id, t.created_at desc, t.id desc
+            ), credits as (
+              select 'CONTRIBUTOR' as role, contributor_id as user_id from last_validation
+                where actor_role in ('CHIEF_LEXICAL_EDITOR', 'SYSTEM')
+              union all
+              select 'CHIEF_LEXICAL_EDITOR', actor_id from last_validation where actor_role = 'CHIEF_LEXICAL_EDITOR'
+              union all
+              select 'LEXICAL_EDITOR', actor_id from last_approval
+            )
+            select c.role, c.user_id, count(*) as entries
+            from credits c join app_user u on u.id = c.user_id and u.role = c.role
+            group by c.role, c.user_id
+            """;
 
     @Transactional(readOnly = true)
     public Map<Role, Map<String, Integer>> rewardPointsByRole() {
-        SystemConfig config = configService.getConfig();
-        int pv = config.getRewardPointPerEntry();
+        int pv = configService.getConfig().getRewardPointPerEntry();
         Map<Role, Map<String, Integer>> board = new EnumMap<>(Role.class);
         for (Role r : RANKED) {
             board.put(r, new HashMap<>());
         }
-        for (Submission sub : submissionRepository.findByState(EntryState.VALIDATED)) {
-            if (!sub.isRewardEligible()) {
-                continue;
-            }
-            List<StateTransition> history = transitionRepository.findBySubmissionIdOrderByCreatedAtAsc(sub.getId());
-            StateTransition validation = null;
-            for (int i = history.size() - 1; i >= 0; i--) {
-                if (history.get(i).getToState() == EntryState.VALIDATED) {
-                    validation = history.get(i);
-                    break;
-                }
-            }
-            if (validation == null) {
-                continue;
-            }
-            boolean viaCle = Role.CHIEF_LEXICAL_EDITOR.name().equals(validation.getActorRole());
-            boolean viaArbitration = "SYSTEM".equals(validation.getActorRole());
-            if (!viaCle && !viaArbitration) {
-                continue;
-            }
-            credit(board, Role.CONTRIBUTOR, sub.getContributorId(), pv);
-            if (viaCle) {
-                credit(board, Role.CHIEF_LEXICAL_EDITOR, validation.getActorId(), pv);
-                for (int i = history.size() - 1; i >= 0; i--) {
-                    if (history.get(i).getToState() == EntryState.EDITOR_APPROVED) {
-                        credit(board, Role.LEXICAL_EDITOR, history.get(i).getActorId(), pv);
-                        break;
-                    }
-                }
-            }
-        }
+        jdbc.query(CREDITS_SQL, new MapSqlParameterSource(), rs -> {
+            board.get(Role.valueOf(rs.getString("role"))).put(rs.getString("user_id"), rs.getInt("entries") * pv);
+        });
         return board;
     }
 
-    private void credit(Map<Role, Map<String, Integer>> board, Role role, String userId, int pv) {
-        AppUser user = userRepository.findById(userId).orElse(null);
-        if (user == null || user.getRole() != role) {
-            return;
+    public static boolean isRanked(Role role) {
+        return RANKED.contains(role);
+    }
+
+    /**
+     * Leaderboard view for the caller: ranked authors only ever see their own role's board;
+     * managers and curators may browse all three.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> boardFor(UserPrincipal principal, String requestedRole) {
+        Role role;
+        if (isRanked(principal.getRole())) {
+            role = principal.getRole();
+        } else {
+            try {
+                role = requestedRole == null ? Role.CONTRIBUTOR : Role.valueOf(requestedRole);
+            } catch (IllegalArgumentException e) {
+                role = Role.CONTRIBUTOR;
+            }
+            if (!isRanked(role)) {
+                role = Role.CONTRIBUTOR;
+            }
         }
-        board.get(role).merge(userId, pv, Integer::sum);
+        List<Map<String, Object>> rows = leaderboardFor(role);
+        SystemConfig c = configService.getConfig();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("role", role.name());
+        body.put("rows", rows);
+        body.put("me", rows.stream().filter(r -> principal.getId().equals(r.get("userId"))).findFirst().orElse(null));
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("rewardPointPerEntry", c.getRewardPointPerEntry());
+        config.put("tierGoldMin", c.getTierGoldMin());
+        config.put("tierSilverMin", c.getTierSilverMin());
+        config.put("tierBronzeMin", c.getTierBronzeMin());
+        body.put("config", config);
+        return body;
     }
 
     public LeaderboardTier tierForPoints(int points) {
@@ -129,6 +166,7 @@ public class LeaderboardService {
             row.put("name", u.getName());
             row.put("username", u.getUsername());
             row.put("points", p);
+            row.put("validatedEntries", c.getRewardPointPerEntry() > 0 ? p / c.getRewardPointPerEntry() : 0);
             row.put("tier", tierForPoints(p).name());
             row.put("toNextTier", next != null ? next.get("min") instanceof Integer min ? min - p : null : null);
             row.put("nextTier", next != null ? next.get("tier") : null);

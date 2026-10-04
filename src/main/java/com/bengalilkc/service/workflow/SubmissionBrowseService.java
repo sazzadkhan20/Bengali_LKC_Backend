@@ -166,8 +166,14 @@ public class SubmissionBrowseService {
                 : null;
         boolean otherStagesDispute = activeCase != null
                 && !ownsArbitrationStage(principal.getRole(), preArbitrationState(activeCase, history));
+        // Editors and chiefs only see cases they are a party to (the arbitration detail is party-scoped too).
+        boolean partyScoped = principal.getRole() == Role.LEXICAL_EDITOR
+                || principal.getRole() == Role.CHIEF_LEXICAL_EDITOR;
+        String me = principal.getId();
         m.put("cases", cases.stream()
                 .filter(c -> !(otherStagesDispute && c == activeCase))
+                .filter(c -> !partyScoped || me.equals(c.getReviewerId()) || me.equals(c.getClaimantId())
+                        || me.equals(c.getContributorId()))
                 .map(c -> {
                     Map<String, Object> cm = new LinkedHashMap<>();
                     cm.put("id", c.getId());
@@ -175,6 +181,10 @@ public class SubmissionBrowseService {
                     cm.put("disputeType", c.getDisputeType() != null ? c.getDisputeType().name() : null);
                     cm.put("openedAt", c.getOpenedAt() != null ? c.getOpenedAt().toString() : null);
                     cm.put("finalVerdict", c.getFinalVerdict() != null ? c.getFinalVerdict().name() : null);
+                    cm.put("verdictBy", c.getVerdictBy() != null ? c.getVerdictBy().name() : null);
+                    cm.put("origin", c.getOrigin() != null ? c.getOrigin().name() : null);
+                    cm.put("stage", c.getStage() != null ? c.getStage().name() : null);
+                    cm.put("resultingState", c.getResultingState() != null ? c.getResultingState().name() : null);
                     return cm;
                 })
                 .toList());
