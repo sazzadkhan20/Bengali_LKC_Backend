@@ -127,6 +127,11 @@ lkc:
     import-lexicon-xml: ${IMPORT_LEXICON_XML:false}
     clear-core-lexicon-before-import: ${CLEAR_CORE_LEXICON_BEFORE_IMPORT:false}
     lexicon-xml-path: ${LEXICON_XML_PATH:Documents/Bangla Mono Lingual Lexicons.xml}
+  captcha:
+    # Google reCAPTCHA v3. Leave both empty to use the checkbox challenge (score threshold inactive).
+    recaptcha:
+      site-key: ${RECAPTCHA_SITE_KEY:}
+      secret-key: ${RECAPTCHA_SECRET_KEY:}
   mail:
     from: ${MAIL_FROM:}
     from-name: ${MAIL_FROM_NAME:Bengali LKC (No Reply)}

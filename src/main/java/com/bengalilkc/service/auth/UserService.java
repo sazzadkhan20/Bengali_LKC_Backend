@@ -1,6 +1,8 @@
 package com.bengalilkc.service.auth;
 
 import com.bengalilkc.common.exception.ApiException;
+import com.bengalilkc.domain.enums.Permission;
+import com.bengalilkc.security.PermissionMatrix;
 import com.bengalilkc.domain.entity.identity.AppUser;
 import com.bengalilkc.domain.entity.identity.Credential;
 import com.bengalilkc.domain.enums.AuditTargetType;
@@ -214,6 +216,13 @@ public class UserService {
             user.setAutoAnnounce(auto);
             userRepository.save(user);
             return Map.of("ok", true);
+        }
+        boolean changesStatus = payload.get("suspended") instanceof Boolean || payload.get("active") instanceof Boolean;
+        if (changesStatus && !PermissionMatrix.has(principal.getRole(), Permission.MANAGE_USERS)) {
+            throw ApiException.forbidden("Only the Platform Architect can change account status.");
+        }
+        if (changesStatus && principal.getId().equals(user.getId())) {
+            throw ApiException.conflict("You cannot change the status of your own account.");
         }
         if (payload.get("suspended") instanceof Boolean suspended) {
             user.setSuspended(suspended);

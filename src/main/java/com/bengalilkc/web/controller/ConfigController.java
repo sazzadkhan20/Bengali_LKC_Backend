@@ -3,6 +3,7 @@ package com.bengalilkc.web.controller;
 import com.bengalilkc.domain.enums.Permission;
 import com.bengalilkc.security.RequirePermission;
 import com.bengalilkc.security.SecurityUtils;
+import com.bengalilkc.service.admin.CaptchaService;
 import com.bengalilkc.service.admin.ConfigService;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
@@ -18,17 +19,24 @@ import org.springframework.web.bind.annotation.RestController;
 public class ConfigController {
 
     private final ConfigService configService;
+    private final CaptchaService captchaService;
 
     @GetMapping
     @RequirePermission(Permission.SYSTEM_CONFIG)
     public Map<String, Object> get() {
-        return configService.toDto(configService.getConfig());
+        return configService.view();
     }
 
     @PutMapping
     @RequirePermission(Permission.SYSTEM_CONFIG)
     public Map<String, Object> put(@RequestBody Map<String, Object> body) {
-        Map<String, Object> config = configService.update(SecurityUtils.requirePrincipal(), body);
-        return Map.of("ok", true, "config", config);
+        return configService.update(SecurityUtils.requirePrincipal(), body);
+    }
+
+    /** CAPTCHA settings the entry forms need; available to every signed-in user. */
+    @GetMapping("/captcha")
+    public Map<String, Object> captcha() {
+        SecurityUtils.requirePrincipal();
+        return captchaService.clientConfig(configService.getConfig().isCaptchaEnabled());
     }
 }

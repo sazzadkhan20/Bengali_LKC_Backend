@@ -48,7 +48,7 @@ public class LookupController {
     /** Live Quick Input validation — the same rules enforced when the entry is saved. */
     @PostMapping("/validate")
     public Map<String, Object> validate(@RequestBody Map<String, Object> body) {
-        return lexiconValidationService.validateEntry(body, SecurityUtils.requirePrincipal().getId());
+        return lexiconValidationService.validateEntry(body, SecurityUtils.requirePrincipal());
     }
 
     @GetMapping("/validate/ili")

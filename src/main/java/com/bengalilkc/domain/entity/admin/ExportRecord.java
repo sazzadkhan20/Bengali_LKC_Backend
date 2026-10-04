@@ -6,6 +6,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
 import java.time.Instant;
+import java.time.LocalDate;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -42,6 +43,36 @@ public class ExportRecord {
 
     @Column(name = "config_json", columnDefinition = "TEXT")
     private String configJson;
+
+    @Column(nullable = false, length = 10)
+    private String scope;
+
+    @Column(length = 40)
+    private String version;
+
+    @Column(name = "pos_filter", length = 20)
+    private String posFilter;
+
+    @Column(name = "range_from")
+    private LocalDate rangeFrom;
+
+    @Column(name = "range_to")
+    private LocalDate rangeTo;
+
+    @Column(name = "baseline_at")
+    private Instant baselineAt;
+
+    @Column(name = "cutoff_at")
+    private Instant cutoffAt;
+
+    @Column(name = "sense_count", nullable = false)
+    private int senseCount;
+
+    @Column(name = "user_senses", nullable = false)
+    private int userSenses;
+
+    @Column(name = "file_bytes", nullable = false)
+    private long fileBytes;
 
     @PrePersist
     void prePersist() {

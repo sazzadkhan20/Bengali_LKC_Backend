@@ -1,7 +1,11 @@
 package com.bengalilkc.service.lexicon;
 
+import com.bengalilkc.domain.enums.EntryState;
 import com.bengalilkc.domain.enums.PartOfSpeech;
+import com.bengalilkc.domain.enums.Permission;
 import com.bengalilkc.repository.workflow.SubmissionRepository;
+import com.bengalilkc.security.PermissionMatrix;
+import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.workflow.EntryValidator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -21,14 +25,18 @@ public class LexiconValidationService {
     private final SubmissionRepository submissionRepository;
 
     /**
-     * {@code excludeSubmissionId} (the entry being resubmitted) is honoured only for its owner.
+     * {@code excludeSubmissionId} (the entry being edited) is honoured only for its owner, or for the
+     * System Moderator correcting an entry that is still in arbitration (tie resolution).
      * {@code nearDuplicate} stays in the response after confirmation so the UI keeps showing it.
      */
     @Transactional(readOnly = true)
-    public Map<String, Object> validateEntry(Map<String, Object> body, String principalId) {
+    public Map<String, Object> validateEntry(Map<String, Object> body, UserPrincipal principal) {
         String excludeId = str(body.get("excludeSubmissionId")).trim();
+        boolean tieBreaker = PermissionMatrix.has(principal.getRole(), Permission.TIE_BREAKER);
         if (!excludeId.isEmpty() && submissionRepository.findById(excludeId)
-                .filter(s -> s.getContributorId().equals(principalId)).isEmpty()) {
+                .filter(s -> s.getContributorId().equals(principal.getId())
+                        || (tieBreaker && s.getState() == EntryState.ARBITRATION))
+                .isEmpty()) {
             excludeId = "";
         }
         EntryValidator.Result result = entryValidator.validate(body, excludeId.isEmpty() ? null : excludeId);

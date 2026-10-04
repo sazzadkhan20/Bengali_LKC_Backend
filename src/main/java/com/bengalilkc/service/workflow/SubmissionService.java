@@ -21,13 +21,13 @@ import com.bengalilkc.repository.workflow.SubmissionRepository;
 import com.bengalilkc.security.PermissionMatrix;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.admin.AuditService;
+import com.bengalilkc.service.admin.CaptchaService;
 import com.bengalilkc.service.admin.ConfigService;
 import com.bengalilkc.service.admin.IdGeneratorService;
 import com.bengalilkc.service.community.LeaderboardService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -84,6 +84,8 @@ public class SubmissionService {
     private final LeaderboardService leaderboardService;
     private final ObjectMapper objectMapper;
     private final AppUserRepository userRepository;
+    private final QuotaService quotaService;
+    private final CaptchaService captchaService;
 
     public SubmissionService(
             SubmissionRepository submissionRepository,
@@ -96,8 +98,12 @@ public class SubmissionService {
             @Lazy ArbitrationService arbitrationService,
             @Lazy LeaderboardService leaderboardService,
             ObjectMapper objectMapper,
-            AppUserRepository userRepository) {
+            AppUserRepository userRepository,
+            QuotaService quotaService,
+            CaptchaService captchaService) {
         this.userRepository = userRepository;
+        this.quotaService = quotaService;
+        this.captchaService = captchaService;
         this.submissionRepository = submissionRepository;
         this.transitionRepository = transitionRepository;
         this.validator = validator;
@@ -144,8 +150,8 @@ public class SubmissionService {
         boolean saveAsDraft = bool(p.get("saveAsDraft"));
         Map<String, String> errors = new LinkedHashMap<>();
 
-        // Anti-bot: too-fast submissions are accepted but held UNDER_REVIEW (SRS §4.3 / §6.2).
-        boolean holdUnderReview = false;
+        // Anti-bot: too-fast or burst submissions are accepted but held UNDER_REVIEW (SRS §4.3 / §6.2).
+        String holdNote = null;
         if (!isModerator) {
             if (config.isHoneypotEnabled() && str(p.get("honeypot")).length() > 0) {
                 Map<String, Object> silent = new LinkedHashMap<>();
@@ -153,21 +159,28 @@ public class SubmissionService {
                 silent.put("id", null);
                 return silent;
             }
+            if (config.isCaptchaEnabled()) {
+                String captchaError = captchaService.verify(p, config.getCaptchaScoreThreshold());
+                if (captchaError != null) {
+                    throw ApiException.unprocessable(Map.of("captcha", captchaError));
+                }
+            }
+            QuotaService.Gate gate = quotaService.check(principal);
+            switch (gate.outcome()) {
+                case SUSPENDED -> throw ApiException.forbidden(gate.message());
+                case BLOCKED_SESSION, BLOCKED_DAY -> throw ApiException.tooManyRequests(gate.message());
+                case ANOMALY_HOLD -> holdNote = "Auto-held: " + gate.lastHour()
+                        + " entries in the last hour exceeds the anomaly alert threshold of "
+                        + config.getAnomalyThresholdPerHour() + " (anti-bot).";
+                case OK -> { }
+            }
             Number elapsed = p.get("elapsedSeconds") instanceof Number n ? n : 0;
-            if (elapsed.intValue() < config.getMinSubmissionSeconds() && !saveAsDraft) {
-                holdUnderReview = true;
-            }
-            if (config.isCaptchaEnabled() && !bool(p.get("captchaPassed"))) {
-                errors.put("captcha", "Please complete the CAPTCHA verification.");
-            }
-            long last24h = submissionRepository.countByContributorIdAndCreatedAtAfter(
-                    principal.getId(), Instant.now().minus(24, ChronoUnit.HOURS));
-            if (last24h >= config.getMaxEntriesPerDay()) {
-                throw ApiException.tooManyRequests(
-                        "Daily entry limit reached (" + config.getMaxEntriesPerDay()
-                                + "/24h). Repeated violations trigger automatic suspension.");
+            if (holdNote == null && elapsed.intValue() < config.getMinSubmissionSeconds()) {
+                holdNote = "Auto-held: form completed faster than minimum "
+                        + config.getMinSubmissionSeconds() + "s (anti-bot).";
             }
         }
+        boolean holdUnderReview = holdNote != null && !saveAsDraft;
 
         validator.lockFor(p);
         EntryValidator.Result result = validator.validate(p, null);
@@ -204,14 +217,7 @@ public class SubmissionService {
         if (!saveAsDraft) {
             if (holdUnderReview) {
                 // Bypass normal LE/CLE queue until a System Moderator clears the anti-bot hold.
-                transition(
-                        sub,
-                        EntryState.UNDER_REVIEW,
-                        principal.getId(),
-                        principal.getRole().name(),
-                        "Auto-held: form completed faster than minimum "
-                                + config.getMinSubmissionSeconds()
-                                + "s (anti-bot).");
+                transition(sub, EntryState.UNDER_REVIEW, principal.getId(), principal.getRole().name(), holdNote);
             } else if (directValidate) {
                 transition(sub, EntryState.PENDING_REVIEW, principal.getId(), principal.getRole().name(), null);
                 validateDirectly(sub, principal);
@@ -421,8 +427,12 @@ public class SubmissionService {
         Map<String, String> errors = new LinkedHashMap<>();
         boolean isModerator = principal.getRole() == Role.SYSTEM_MODERATOR
                 || principal.getRole() == Role.PLATFORM_ARCHITECT;
-        if (!isModerator && configService.getConfig().isCaptchaEnabled() && !bool(p.get("captchaPassed"))) {
-            errors.put("captcha", "Please complete the CAPTCHA verification.");
+        var config = configService.getConfig();
+        if (!isModerator && config.isCaptchaEnabled()) {
+            String captchaError = captchaService.verify(p, config.getCaptchaScoreThreshold());
+            if (captchaError != null) {
+                errors.put("captcha", captchaError);
+            }
         }
         validator.lockFor(p);
         EntryValidator.Result result = validator.validate(p, sub.getId());
@@ -457,6 +467,42 @@ public class SubmissionService {
         res.put("changed", changed);
         res.put("version", sub.getVersion());
         return res;
+    }
+
+    /**
+     * Tie resolution: the System Moderator corrects the tied entry (validated exactly like a Quick Input entry)
+     * and it moves straight from ARBITRATION to VALIDATED. Returns the fields that changed.
+     */
+    @Transactional
+    public List<String> correctAndValidateTiedEntry(
+            UserPrincipal principal, Submission sub, Map<String, Object> p, String caseId) {
+        if (sub.getState() != EntryState.ARBITRATION) {
+            throw ApiException.conflict("This entry is now " + sub.getState().name()
+                    + "; only entries still in arbitration can be corrected from a tied case.");
+        }
+        requireVersion(sub, p.get("expectedVersion"));
+        Map<String, Object> payload = new LinkedHashMap<>(p);
+        // The contributor's own note is part of the record; the moderator form does not edit it.
+        if (str(payload.get("reviewerNote")).isBlank()) {
+            payload.put("reviewerNote", sub.getReviewerNote());
+        }
+        validator.lockFor(payload);
+        EntryValidator.Result result = validator.validate(payload, sub.getId());
+        if (!result.errors().isEmpty()) {
+            throw ApiException.unprocessable(result.errors());
+        }
+        EntryValidator.EntryInput in = result.input();
+        requireNearConfirmed(result, payload);
+        List<String> changed = changedFields(sub, in);
+        applyEntry(sub, in);
+        sub.setValidatedBy(principal.getId());
+        sub.setValidatedAt(Instant.now());
+        sub.setRewardEligible(false);
+        transition(sub, EntryState.VALIDATED, principal.getId(), principal.getRole().name(),
+                "Tied arbitration " + caseId + " resolved by the System Moderator: entry "
+                        + (changed.isEmpty() ? "validated without changes." : "corrected (" + String.join(", ", changed) + ") and validated."));
+        submissionRepository.flush();
+        return changed;
     }
 
     /** Contributor dispute of a FLAGGED / C-FLAGGED decision; opens an arbitration case. */
@@ -496,7 +542,7 @@ public class SubmissionService {
                 actions.add(ownerAction("RESUBMIT", "Resubmission", validatesDirectly(principal.getRole())
                         ? EntryState.VALIDATED
                         : resubmitTarget(sub.getState())));
-                if (PermissionMatrix.has(principal.getRole(), Permission.DISPUTE)) {
+                if (PermissionMatrix.has(principal.getRole(), Permission.DISPUTE) && !decidedByArbitration(sub)) {
                     Map<String, Object> d = ownerAction("DISPUTE", "Dispute to arbitration", EntryState.ARBITRATION);
                     d.put("noteMin", DISPUTE_NOTE_MIN);
                     d.put("noteMax", DISPUTE_NOTE_MAX);
@@ -821,6 +867,18 @@ public class SubmissionService {
     public Submission require(String id) {
         return submissionRepository.findById(id)
                 .orElseThrow(() -> ApiException.notFound("Submission not found"));
+    }
+
+    /** True when the entry's current state was set by an arbitration decision, which cannot be appealed. */
+    public boolean decidedByArbitration(Submission sub) {
+        List<StateTransition> history = transitionRepository.findBySubmissionIdOrderByCreatedAtAsc(sub.getId());
+        for (int i = history.size() - 1; i >= 0; i--) {
+            StateTransition t = history.get(i);
+            if (t.getToState() == sub.getState()) {
+                return t.getFromState() == EntryState.ARBITRATION && "SYSTEM".equals(t.getActorRole());
+            }
+        }
+        return false;
     }
 
     @Transactional
