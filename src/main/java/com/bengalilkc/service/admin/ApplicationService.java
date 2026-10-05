@@ -9,6 +9,9 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.format.DateTimeParseException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +19,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -37,6 +41,11 @@ public class ApplicationService {
     private static final Pattern PHONE = Pattern.compile("^[+0-9()\\-.\\s]{6,30}$");
     private static final int MAX_PER_EMAIL_PER_DAY = 3;
     private static final int MAX_PER_IP_PER_DAY = 10;
+    private static final ZoneId DHAKA = ZoneId.of("Asia/Dhaka");
+    private static final String REGISTERED_EMAIL_MESSAGE =
+            "This email is already registered with a Ben-LKC account. Sign in instead, or use “Forgot password” if you cannot access it.";
+    private static final String PENDING_EMAIL_MESSAGE =
+            "An application from this email is already awaiting review. The Platform Architect will contact you by email.";
 
     private final NamedParameterJdbcTemplate jdbc;
     private final IdGeneratorService idGeneratorService;
@@ -49,12 +58,15 @@ public class ApplicationService {
     public Map<String, Object> submit(Map<String, Object> body, String clientIp) {
         if (!str(body.get("honeypot")).isBlank()) {
             // Bots get the normal response so they do not learn about the trap.
+            log.warn("Discarded application with a filled honeypot from {}", clientIp);
             return Map.of("ok", true, "message", acknowledgement());
         }
         String name = collapse(str(body.get("name")));
         String email = str(body.get("email")).trim().toLowerCase();
         String phone = collapse(str(body.get("phone")));
         String institution = collapse(str(body.get("institution")));
+        String occupation = collapse(str(body.get("occupation")));
+        String dobRaw = str(body.get("dob")).trim();
         String interestRole = str(body.get("interestRole")).trim().toUpperCase();
         String message = str(body.get("message")).trim();
 
@@ -74,8 +86,31 @@ public class ApplicationService {
         } else if (!PHONE.matcher(phone).matches() || phone.chars().filter(Character::isDigit).count() < 6) {
             errors.put("phone", "Enter a reachable phone number (digits, spaces, + - ( ) only).");
         }
-        if (institution.length() > 120) {
+        LocalDate dob = null;
+        if (dobRaw.isEmpty()) {
+            errors.put("dob", "Date of birth is required.");
+        } else {
+            try {
+                dob = LocalDate.parse(dobRaw);
+            } catch (DateTimeParseException e) {
+                errors.put("dob", "Enter a valid date of birth.");
+            }
+            LocalDate today = LocalDate.now(DHAKA);
+            if (dob != null && !dob.isBefore(today)) {
+                errors.put("dob", "Date of birth must be in the past.");
+            } else if (dob != null && dob.isBefore(today.minusYears(120))) {
+                errors.put("dob", "Enter a valid date of birth.");
+            }
+        }
+        if (institution.isEmpty()) {
+            errors.put("institution", "Institution or affiliation is required.");
+        } else if (institution.length() > 120) {
             errors.put("institution", "Institution must be at most 120 characters.");
+        }
+        if (occupation.isEmpty()) {
+            errors.put("occupation", "Occupation is required.");
+        } else if (occupation.length() > 80) {
+            errors.put("occupation", "Occupation must be at most 80 characters.");
         }
         if (!interestRole.isEmpty() && !INTEREST_ROLES.contains(interestRole)) {
             errors.put("interestRole", "Select one of the listed roles.");
@@ -84,6 +119,12 @@ public class ApplicationService {
             errors.put("message", "Please explain why you want to join (at least 20 characters).");
         } else if (message.length() > 800) {
             errors.put("message", "Message must be at most 800 characters.");
+        }
+        if (!errors.containsKey("email")) {
+            String conflict = emailConflict(email);
+            if (conflict != null) {
+                errors.put("email", conflict);
+            }
         }
         if (!errors.isEmpty()) {
             throw ApiException.unprocessable(errors);
@@ -110,17 +151,24 @@ public class ApplicationService {
         }
 
         String id = "app-" + idGeneratorService.nextValue("application");
-        jdbc.update("""
-                insert into contribute_application (id, name, email, phone, institution, interest_role, message, client_ip)
-                values (:id, :name, :email, :phone, :institution, :role, :message, :ip)
-                """, new MapSqlParameterSource("id", id)
-                .addValue("name", name)
-                .addValue("email", email)
-                .addValue("phone", phone)
-                .addValue("institution", institution.isEmpty() ? null : institution)
-                .addValue("role", interestRole.isEmpty() ? null : interestRole)
-                .addValue("message", message)
-                .addValue("ip", ip == null || ip.isEmpty() ? null : truncate(ip, 64)));
+        try {
+            jdbc.update("""
+                    insert into contribute_application
+                        (id, name, email, phone, institution, occupation, dob, interest_role, message, client_ip)
+                    values (:id, :name, :email, :phone, :institution, :occupation, :dob, :role, :message, :ip)
+                    """, new MapSqlParameterSource("id", id)
+                    .addValue("name", name)
+                    .addValue("email", email)
+                    .addValue("phone", phone)
+                    .addValue("institution", institution)
+                    .addValue("occupation", occupation)
+                    .addValue("dob", dob)
+                    .addValue("role", interestRole.isEmpty() ? null : interestRole)
+                    .addValue("message", message)
+                    .addValue("ip", ip == null || ip.isEmpty() ? null : truncate(ip, 64)));
+        } catch (DuplicateKeyException e) {
+            throw ApiException.unprocessable(Map.of("email", PENDING_EMAIL_MESSAGE));
+        }
         auditService.recordSystem("APPLICATION_RECEIVED", AuditTargetType.APPLICATION, id,
                 name + " <" + email + ">" + (interestRole.isEmpty() ? "" : " — interested in " + interestRole));
 
@@ -129,6 +177,20 @@ public class ApplicationService {
         out.put("id", id);
         out.put("message", acknowledgement());
         return out;
+    }
+
+    /** Why this email cannot apply, or null when it is free to use. */
+    private String emailConflict(String email) {
+        MapSqlParameterSource args = new MapSqlParameterSource("email", email);
+        Boolean registered = jdbc.queryForObject(
+                "select exists (select 1 from app_user where lower(email) = :email)", args, Boolean.class);
+        if (Boolean.TRUE.equals(registered)) {
+            return REGISTERED_EMAIL_MESSAGE;
+        }
+        Boolean pending = jdbc.queryForObject(
+                "select exists (select 1 from contribute_application where lower(email) = :email and status = 'NEW')",
+                args, Boolean.class);
+        return Boolean.TRUE.equals(pending) ? PENDING_EMAIL_MESSAGE : null;
     }
 
     private static String acknowledgement() {
@@ -266,12 +328,16 @@ public class ApplicationService {
     // ------------------------------------------------------------------ helpers
 
     private static final String SELECT = """
-            select a.id, a.name, a.email, a.phone, a.institution, a.interest_role, a.message, a.status,
-                   a.review_note, a.reviewed_at, a.created_at, a.issued_user_id,
-                   r.name as reviewer_name, u.username as issued_username, u.role as issued_role
+            select a.id, a.name, a.email, a.phone, a.institution, a.occupation, a.dob, a.interest_role, a.message,
+                   a.status, a.review_note, a.reviewed_at, a.created_at, a.issued_user_id,
+                   r.name as reviewer_name, u.username as issued_username, u.role as issued_role,
+                   e.id as existing_user_id, e.username as existing_username
             from contribute_application a
             left join app_user r on r.id = a.reviewed_by
             left join app_user u on u.id = a.issued_user_id
+            left join lateral (
+                select x.id, x.username from app_user x where lower(x.email) = lower(a.email) limit 1
+            ) e on true
             """;
 
     private Map<String, Object> find(String rawId) {
@@ -298,6 +364,9 @@ public class ApplicationService {
         m.put("email", rs.getString("email"));
         m.put("phone", rs.getString("phone"));
         m.put("institution", rs.getString("institution"));
+        m.put("occupation", rs.getString("occupation"));
+        java.sql.Date dob = rs.getDate("dob");
+        m.put("dob", dob == null ? null : dob.toLocalDate().toString());
         m.put("interestRole", rs.getString("interest_role"));
         m.put("message", rs.getString("message"));
         m.put("status", rs.getString("status"));
@@ -308,6 +377,11 @@ public class ApplicationService {
         m.put("issuedUserId", rs.getString("issued_user_id"));
         m.put("issuedUsername", rs.getString("issued_username"));
         m.put("issuedRole", rs.getString("issued_role"));
+        String existingUserId = rs.getString("existing_user_id");
+        boolean issuedToThatUser = existingUserId != null && existingUserId.equals(rs.getString("issued_user_id"));
+        m.put("existingAccount", existingUserId == null || issuedToThatUser
+                ? null
+                : Map.of("id", existingUserId, "username", rs.getString("existing_username")));
         return m;
     }
 

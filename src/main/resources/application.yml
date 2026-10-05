@@ -127,6 +127,11 @@ lkc:
     import-lexicon-xml: ${IMPORT_LEXICON_XML:false}
     clear-core-lexicon-before-import: ${CLEAR_CORE_LEXICON_BEFORE_IMPORT:false}
     lexicon-xml-path: ${LEXICON_XML_PATH:Documents/Bangla Mono Lingual Lexicons.xml}
+    initial-architect:
+      username: ${LKC_INITIAL_ARCHITECT_USERNAME:}
+      email: ${LKC_INITIAL_ARCHITECT_EMAIL:}
+      name: ${LKC_INITIAL_ARCHITECT_NAME:}
+      password: ${LKC_INITIAL_ARCHITECT_PASSWORD:}
   captcha:
     # Google reCAPTCHA v3. Leave both empty to use the checkbox challenge (score threshold inactive).
     recaptcha:

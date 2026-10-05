@@ -47,7 +47,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
             HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
         String path = request.getRequestURI();
-        if (path.startsWith("/actuator") || path.startsWith("/swagger") || path.startsWith("/v3/api-docs")) {
+        // The frontend server resolves the session on every page render; throttling it would sign
+        // people out mid-navigation, and the token check behind it is cheap.
+        boolean sessionRead = "GET".equals(request.getMethod()) && "/api/auth/session".equals(path);
+        if (sessionRead || path.startsWith("/actuator") || path.startsWith("/swagger") || path.startsWith("/v3/api-docs")) {
             filterChain.doFilter(request, response);
             return;
         }

@@ -50,6 +50,23 @@ public class LkcProperties {
         /** When true with import, wipe core lexicon tables first then reload from XML. */
         private boolean clearCoreLexiconBeforeImport = false;
         private String lexiconXmlPath = "Documents/Bangla Mono Lingual Lexicons.xml";
+        private InitialArchitect initialArchitect = new InitialArchitect();
+    }
+
+    /**
+     * First Platform Architect for a fresh deployment. Created once when all fields are set and
+     * neither the username nor the email exists yet; never updated afterwards.
+     */
+    @Data
+    public static class InitialArchitect {
+        private String username = "";
+        private String email = "";
+        private String name = "";
+        private String password = "";
+
+        public boolean isConfigured() {
+            return !username.isBlank() && !email.isBlank() && !name.isBlank() && !password.isBlank();
+        }
     }
 
     @Data

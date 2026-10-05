@@ -1,0 +1,134 @@
+# Bengali LKC — production stack (one server, see DEPLOYMENT.md).
+#
+# Never run this file directly; use deploy/scripts/*.sh, which pass the right env files:
+#   /opt/bengali-lkc/.env          secrets and settings (never in git)
+#   /opt/bengali-lkc/release.env   image tags currently deployed (written by deploy.sh)
+#
+# Only nginx is published. Postgres, the API and the Next.js server are reachable only on the
+# private `internal` network. The Postgres and certificate volumes are `external`, so no compose
+# command (not even `down -v`) can delete them.
+
+name: bengali-lkc-prod
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: Asia/Dhaka
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [internal]
+    logging: *logging
+
+  backend:
+    image: bengali-lkc-backend:${BACKEND_TAG:-none}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SERVER_PORT: 8080
+      TZ: Asia/Dhaka
+      JAVA_OPTS: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=70.0"
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      CORS_ORIGINS: https://${DOMAIN:?set DOMAIN in .env}
+      MAIL_HOST: ${MAIL_HOST:-smtp.gmail.com}
+      MAIL_PORT: ${MAIL_PORT:-587}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Bengali LKC (No Reply)}
+      RECAPTCHA_SITE_KEY: ${RECAPTCHA_SITE_KEY:-}
+      RECAPTCHA_SECRET_KEY: ${RECAPTCHA_SECRET_KEY:-}
+      LKC_INITIAL_ARCHITECT_USERNAME: ${LKC_INITIAL_ARCHITECT_USERNAME:-}
+      LKC_INITIAL_ARCHITECT_EMAIL: ${LKC_INITIAL_ARCHITECT_EMAIL:-}
+      LKC_INITIAL_ARCHITECT_NAME: ${LKC_INITIAL_ARCHITECT_NAME:-}
+      LKC_INITIAL_ARCHITECT_PASSWORD: ${LKC_INITIAL_ARCHITECT_PASSWORD:-}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      # The first boot imports the lexicon XML.
+      start_period: 180s
+    networks: [internal]
+    logging: *logging
+
+  frontend:
+    image: bengali-lkc-frontend:${FRONTEND_TAG:-none}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_API_URL: http://backend:8080
+      TZ: Asia/Dhaka
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    networks: [internal]
+    logging: *logging
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - letsencrypt:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot:ro
+    # Reload every 6 hours so renewed certificates are picked up.
+    command: ["/bin/sh", "-c", "while :; do sleep 6h & wait $${!}; nginx -s reload; done & exec nginx -g 'daemon off;'"]
+    networks: [internal]
+    logging: *logging
+
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: ["/bin/sh", "-c", "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done"]
+    networks: [internal]
+    logging: *logging
+
+volumes:
+  pgdata:
+    external: true
+    name: bengali-lkc-pgdata
+  letsencrypt:
+    external: true
+    name: bengali-lkc-letsencrypt
+  certbot-www:
+    name: bengali-lkc-certbot-www
+
+networks:
+  internal:
+    name: bengali-lkc-internal
