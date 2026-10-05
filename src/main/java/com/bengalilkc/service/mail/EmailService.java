@@ -116,6 +116,40 @@ public class EmailService {
         sendNoReply(toEmail, subject, text, html);
     }
 
+    public void sendApplicationDeclined(String toEmail, String name, String note) {
+        String subject = "Bengali LKC — Your contribution request";
+        String text = """
+                Dear %s,
+
+                Thank you for your interest in contributing to the Bengali Local Knowledge Core (Ben-LKC).
+
+                After review, the Platform Architect is unable to issue an account at this time.
+
+                Note from the reviewer:
+                %s
+
+                You are welcome to apply again in the future.
+
+                This is an automated message. Please do not reply to this email.
+
+                — Bengali LKC
+                """.formatted(name, note);
+        String html = """
+                <div style="font-family:Segoe UI,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#0f172a">
+                  <h2 style="color:#047857;margin:0 0 12px">Your contribution request</h2>
+                  <p>Dear <strong>%s</strong>,</p>
+                  <p>Thank you for your interest in contributing to the Bengali Local Knowledge Core (Ben-LKC).</p>
+                  <p>After review, the Platform Architect is unable to issue an account at this time.</p>
+                  <p style="font-size:14px;color:#334155;line-height:1.55;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;margin:12px 0;white-space:pre-line"><strong>Note from the reviewer:</strong><br/>%s</p>
+                  <p style="color:#64748b;font-size:14px">You are welcome to apply again in the future.</p>
+                  <p style="margin-top:20px;font-size:12px;color:#94a3b8">This is an automated message. Please do not reply.</p>
+                  <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0"/>
+                  <p style="font-size:12px;color:#94a3b8">Bengali Local Knowledge Core (Ben-LKC)</p>
+                </div>
+                """.formatted(escape(name), escape(note));
+        sendNoReply(toEmail, subject, text, html);
+    }
+
     private String credentialText(
             String name, String email, String username, String password, String reason) {
         return """

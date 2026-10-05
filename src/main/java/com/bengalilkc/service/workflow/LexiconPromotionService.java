@@ -9,6 +9,7 @@ import com.bengalilkc.domain.enums.AuditTargetType;
 import com.bengalilkc.domain.enums.SynsetAction;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.IdGeneratorService;
+import com.bengalilkc.service.lexicon.LexiconStatsService;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -17,6 +18,8 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * Copies a validated submission into the lexicon tables (origin {@code USER}, linked back to the
@@ -33,6 +36,7 @@ public class LexiconPromotionService {
     private final IdGeneratorService ids;
     private final EntryValidator validator;
     private final AuditService auditService;
+    private final LexiconStatsService statsService;
 
     public void promote(Submission sub, String actorId, String actorRole) {
         if (isPromoted(sub.getId())) {
@@ -148,6 +152,7 @@ public class LexiconPromotionService {
         auditService.record(actorId, actorRole, "LEXICON_PROMOTED", AuditTargetType.SUBMISSION, sub.getId(),
                 label + " added to the lexicon as sense " + senseId + " in synset " + synsetId
                         + (synsetCreated ? " (new synset)" : ""));
+        refreshStatsAfterCommit();
     }
 
     /** Removes the promoted rows; refuses when other lexicon data already depends on them. */
@@ -197,6 +202,21 @@ public class LexiconPromotionService {
                 """, p);
         auditService.record(actorId, actorRole, "LEXICON_DEMOTED", AuditTargetType.SUBMISSION, sub.getId(),
                 "“" + sub.getWrittenForm() + "” removed from the lexicon (sense " + senseId + ")");
+        refreshStatsAfterCommit();
+    }
+
+    /** Public counts are cached; refresh them once the lexicon change is committed. */
+    private void refreshStatsAfterCommit() {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    statsService.invalidate();
+                }
+            });
+        } else {
+            statsService.invalidate();
+        }
     }
 
     private boolean isPromoted(String submissionId) {

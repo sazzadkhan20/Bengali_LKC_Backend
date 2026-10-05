@@ -60,11 +60,6 @@ public class LexiconQueryService {
         return fresh;
     }
 
-    @Transactional(readOnly = true)
-    public Map<String, Object> publicStats() {
-        return new LinkedHashMap<>(corpusCounts());
-    }
-
     /** Sense-relation target search — by Bengali word (returns sense ids). */
     @Transactional(readOnly = true)
     public Map<String, Object> lookupWords(String q, String posParam) {
@@ -184,74 +179,6 @@ public class LexiconQueryService {
         return Map.of("results", results, "registry", registry);
     }
 
-    @Transactional(readOnly = true)
-    public Map<String, Object> searchByLemma(String q, int limit) {
-        List<LexicalEntryEntity> entries = entryRepository.findByWrittenFormStartingWithOrderByWrittenFormAsc(
-                q == null ? "" : q.trim(), PageRequest.of(0, Math.min(Math.max(limit, 1), 50)));
-        return Map.of("results", entries.stream().map(this::entrySummary).toList());
-    }
-
-    @Transactional(readOnly = true)
-    public Map<String, Object> browseByLetter(String letter, int limit) {
-        if (letter == null || letter.isBlank()) {
-            throw ApiException.badRequest("letter is required");
-        }
-        return Map.of(
-                "results",
-                entryRepository
-                        .findByInitialLetter(letter.substring(0, 1), PageRequest.of(0, Math.min(limit, 100)))
-                        .stream()
-                        .map(this::entrySummary)
-                        .toList());
-    }
-
-    @Transactional(readOnly = true)
-    public Map<String, Object> getWord(String id) {
-        LexicalEntryEntity e =
-                entryRepository.findById(id).orElseThrow(() -> ApiException.notFound("Word not found"));
-        Map<String, Object> m = entrySummary(e);
-        List<Map<String, Object>> senses = new ArrayList<>();
-        for (SenseEntity s : senseRepository.findByLexicalEntryId(id)) {
-            Map<String, Object> sm = new LinkedHashMap<>();
-            sm.put("id", s.getId());
-            sm.put("synset", s.getSynset().getId());
-            senses.add(sm);
-        }
-        m.put("senses", senses);
-        return m;
-    }
-
-    @Transactional(readOnly = true)
-    public Map<String, Object> getSynset(String id) {
-        SynsetEntity syn =
-                synsetRepository.findById(id).orElseThrow(() -> ApiException.notFound("Synset not found"));
-        Map<String, Object> m = synsetRow(syn);
-        List<Map<String, Object>> relations = new ArrayList<>();
-        for (SynsetRelationEntity rel : synsetRelationRepository.findBySourceSynsetId(id)) {
-            relations.add(Map.of(
-                    "relType", rel.getRelationType().getRelationName(),
-                    "target", rel.getTargetSynset().getId()));
-        }
-        m.put("relations", relations);
-        m.put("lexicalized", syn.isLexicalized());
-        if (syn.getDefinitionText() != null) {
-            m.put(
-                    "definition",
-                    Map.of(
-                            "language",
-                            syn.getDefinitionLanguage() != null
-                                    ? syn.getDefinitionLanguage().getCode()
-                                    : "ben",
-                            "text",
-                            syn.getDefinitionText()));
-        }
-        return m;
-    }
-
-    private Map<String, Object> synsetRow(SynsetEntity syn) {
-        return synsetRows(List.of(syn)).get(0);
-    }
-
     /** Builds result rows with member words fetched in a single query for all synsets. */
     private List<Map<String, Object>> synsetRows(java.util.Collection<SynsetEntity> synsets) {
         if (synsets.isEmpty()) {
@@ -277,14 +204,6 @@ public class LexiconQueryService {
             rows.add(row);
         }
         return rows;
-    }
-
-    private Map<String, Object> entrySummary(LexicalEntryEntity e) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("id", e.getId());
-        m.put("lemma", e.getWrittenForm());
-        m.put("pos", e.getPartOfSpeech().getCode());
-        return m;
     }
 
     private static PartOfSpeech parsePos(String posParam) {

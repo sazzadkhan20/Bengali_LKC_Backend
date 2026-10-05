@@ -10,6 +10,7 @@ import com.bengalilkc.domain.enums.Role;
 import com.bengalilkc.repository.identity.AppUserRepository;
 import com.bengalilkc.repository.identity.CredentialRepository;
 import com.bengalilkc.security.UserPrincipal;
+import com.bengalilkc.service.admin.ApplicationService;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.IdGeneratorService;
 import com.bengalilkc.service.mail.EmailService;
@@ -40,6 +41,7 @@ public class UserService {
     private final IdGeneratorService idGeneratorService;
     private final AuditService auditService;
     private final EmailService emailService;
+    private final ApplicationService applicationService;
 
     @Transactional(readOnly = true)
     public List<Map<String, Object>> listUsers() {
@@ -154,6 +156,10 @@ public class UserService {
         if (userRepository.existsByEmailIgnoreCase(email)) {
             throw ApiException.conflict("An account with this email already exists.");
         }
+        String applicationId = str(payload.get("applicationId")).trim();
+        if (!applicationId.isEmpty()) {
+            applicationService.lockForApproval(applicationId);
+        }
 
         String userId = "u-" + idGeneratorService.nextValue("user");
         AppUser user = AppUser.builder()
@@ -189,6 +195,10 @@ public class UserService {
         auditService.record(principal, "USER_CREATED", AuditTargetType.USER, userId, name + " (" + role + ")");
         auditService.record(principal, "CREDENTIAL_ISSUED", AuditTargetType.CREDENTIAL, credId,
                 "One-time password emailed to " + email + "; change required at first login");
+        if (!applicationId.isEmpty()) {
+            userRepository.flush();
+            applicationService.markApproved(principal, applicationId, userId, username, role.name());
+        }
 
         emailService.sendCredentialIssued(email, name, username, oneTimePassword);
 
@@ -203,6 +213,9 @@ public class UserService {
         body.put("ok", true);
         body.put("user", Map.of("id", userId, "name", name, "role", role.name()));
         body.put("credential", credBody);
+        if (!applicationId.isEmpty()) {
+            body.put("applicationId", applicationId);
+        }
         return body;
     }
 

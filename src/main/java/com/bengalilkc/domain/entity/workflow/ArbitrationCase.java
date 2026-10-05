@@ -92,6 +92,10 @@ public class ArbitrationCase {
     @Column(name = "resolution_note", columnDefinition = "TEXT")
     private String resolutionNote;
 
+    /** JSON list of {field, before, after} recorded when the System Moderator corrects a tied entry. */
+    @Column(name = "tie_corrections_json", columnDefinition = "TEXT")
+    private String tieCorrectionsJson;
+
     @Enumerated(EnumType.STRING)
     @Column(name = "pre_arbitration_state", length = 40)
     private EntryState preArbitrationState;
