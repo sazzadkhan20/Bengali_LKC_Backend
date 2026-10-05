@@ -73,6 +73,7 @@ public class ArbitrationService {
     private final IdGeneratorService idGeneratorService;
     private final AuditService auditService;
     private final SubmissionService submissionService;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     public ArbitrationService(
             ArbitrationCaseRepository caseRepository,
@@ -83,7 +84,9 @@ public class ArbitrationService {
             NamedParameterJdbcTemplate jdbc,
             IdGeneratorService idGeneratorService,
             AuditService auditService,
-            @Lazy SubmissionService submissionService) {
+            @Lazy SubmissionService submissionService,
+            com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
         this.caseRepository = caseRepository;
         this.voteRepository = voteRepository;
         this.userRepository = userRepository;
@@ -374,7 +377,14 @@ public class ArbitrationService {
                     : "Only tied cases can be resolved by the System Moderator.");
         }
         Submission sub = submissionService.require(c.getSubmissionId());
-        List<String> changed = submissionService.correctAndValidateTiedEntry(principal, sub, p, c.getId());
+        SubmissionService.TieCorrection correction =
+                submissionService.correctAndValidateTiedEntry(principal, sub, p, c.getId());
+        List<String> changed = correction.changed();
+        try {
+            c.setTieCorrectionsJson(objectMapper.writeValueAsString(correction.details()));
+        } catch (Exception e) {
+            c.setTieCorrectionsJson("[]");
+        }
         Instant now = Instant.now();
         c.setStatus(ArbitrationStatus.RESOLVED);
         c.setVerdictBy(VerdictBy.TIE_BREAK);

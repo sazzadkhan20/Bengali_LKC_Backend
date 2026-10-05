@@ -49,6 +49,7 @@ public class LexiconStatsService {
                 select (select count(*) from lexical_entry) as entries,
                        (select count(*) from lexical_entry where origin = 'USER') as crowdsourced_entries,
                        (select count(*) from sense) as senses,
+                       (select count(*) from sense where origin = 'USER') as crowdsourced_senses,
                        (select count(*) from synset) as synsets,
                        (select count(*) from synset where origin = 'USER') as crowdsourced_synsets,
                        (select count(*) from synset where definition_language = 'ben') as definitions_ben,
@@ -61,6 +62,8 @@ public class LexiconStatsService {
 
         Map<String, Object> m = new LinkedHashMap<>();
         totals.forEach((k, v) -> m.put(camel(k), ((Number) v).longValue()));
+        m.put("relations", (Long) m.get("synsetRelations") + (Long) m.get("senseRelations"));
+        m.put("generatedAt", Instant.now().toString());
 
         Map<String, Long> pos = new LinkedHashMap<>();
         for (String p : new String[] {"n", "v", "a", "r"}) {

@@ -8,6 +8,8 @@ import com.bengalilkc.service.admin.ConfigService;
 import com.bengalilkc.service.lexicon.LexiconStatsService;
 import com.bengalilkc.service.workflow.ArbitrationService;
 import com.bengalilkc.service.workflow.QuotaService;
+import com.bengalilkc.service.workflow.TieCorrectionService;
+import com.bengalilkc.service.admin.ApplicationService;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
@@ -43,6 +45,8 @@ public class DashboardService {
     private final ConfigService configService;
     private final QuotaService quotaService;
     private final LexiconStatsService lexiconStatsService;
+    private final TieCorrectionService tieCorrectionService;
+    private final ApplicationService applicationService;
 
     @Transactional(readOnly = true)
     public Map<String, Object> forUser(UserPrincipal principal) {
@@ -126,6 +130,7 @@ public class DashboardService {
                 "select count(*) from submission where state = 'UNDER_REVIEW' and updated_at < now() - interval '48 hours'"));
         m.put("lexicon", lexiconCounts());
         m.put("lastExport", lastExport());
+        m.put("newApplications", applicationService.countNew());
         m.put("topContributors", topContributors(30, 8));
         m.put("recentActivity", recentAudit(20, null));
         return m;
@@ -138,8 +143,7 @@ public class DashboardService {
                 "select count(*) from submission where state = 'UNDER_REVIEW' and updated_at < now() - interval '30 days'"));
         m.put("openCases", cases("c.status <> 'RESOLVED'", null, 8));
         m.put("ties", cases("c.status = 'TIE_PENDING'", null, 20));
-        m.put("pendingCorrections", cases(
-                "c.status = 'RESOLVED' and c.correction_note is not null and not c.correction_applied", null, 10));
+        m.put("recentCorrections", tieCorrectionService.recent(5));
         m.put("weekly", weeklySeries("select created_at as at from submission where state <> 'DRAFT'", null, 5));
         m.put("recentActivity", recentAudit(8, List.of("SUBMISSION", "ARBITRATION", "USER")));
         SystemConfig cfg = configService.getConfig();

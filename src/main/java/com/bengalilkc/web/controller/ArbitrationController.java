@@ -1,11 +1,14 @@
 package com.bengalilkc.web.controller;
 
 import com.bengalilkc.common.exception.ApiException;
+import com.bengalilkc.domain.enums.Permission;
 import com.bengalilkc.domain.enums.Role;
 import com.bengalilkc.scheduling.ArbitrationDeadlineJob;
+import com.bengalilkc.security.RequirePermission;
 import com.bengalilkc.security.SecurityUtils;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.workflow.ArbitrationService;
+import com.bengalilkc.service.workflow.TieCorrectionService;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -23,6 +26,7 @@ public class ArbitrationController {
 
     private final ArbitrationService arbitrationService;
     private final ArbitrationDeadlineJob deadlineJob;
+    private final TieCorrectionService tieCorrectionService;
 
     /**
      * Paged cases. Curators and managers see every case, contributors and reviewers the cases they are party to.
@@ -37,6 +41,16 @@ public class ArbitrationController {
             @RequestParam(required = false) Integer size) {
         return arbitrationService.browse(
                 SecurityUtils.requirePrincipal(), new ArbitrationService.Criteria(q, phase, page, size));
+    }
+
+    /** System Moderator corrections desk: tied cases awaiting a corrected entry plus paged correction history. */
+    @GetMapping("/corrections")
+    @RequirePermission(Permission.APPLY_CORRECTIONS)
+    public Map<String, Object> corrections(
+            @RequestParam(required = false) String q,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        return tieCorrectionService.overview(q, page, size);
     }
 
     @GetMapping("/{id}")

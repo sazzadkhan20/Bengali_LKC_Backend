@@ -469,12 +469,15 @@ public class SubmissionService {
         return res;
     }
 
+    /** Fields a tie correction changed, plus a before/after value for each. */
+    public record TieCorrection(List<String> changed, List<Map<String, Object>> details) {}
+
     /**
      * Tie resolution: the System Moderator corrects the tied entry (validated exactly like a Quick Input entry)
-     * and it moves straight from ARBITRATION to VALIDATED. Returns the fields that changed.
+     * and it moves straight from ARBITRATION to VALIDATED.
      */
     @Transactional
-    public List<String> correctAndValidateTiedEntry(
+    public TieCorrection correctAndValidateTiedEntry(
             UserPrincipal principal, Submission sub, Map<String, Object> p, String caseId) {
         if (sub.getState() != EntryState.ARBITRATION) {
             throw ApiException.conflict("This entry is now " + sub.getState().name()
@@ -494,6 +497,7 @@ public class SubmissionService {
         EntryValidator.EntryInput in = result.input();
         requireNearConfirmed(result, payload);
         List<String> changed = changedFields(sub, in);
+        List<Map<String, Object>> details = changeDetails(sub, in, changed);
         applyEntry(sub, in);
         sub.setValidatedBy(principal.getId());
         sub.setValidatedAt(Instant.now());
@@ -502,7 +506,75 @@ public class SubmissionService {
                 "Tied arbitration " + caseId + " resolved by the System Moderator: entry "
                         + (changed.isEmpty() ? "validated without changes." : "corrected (" + String.join(", ", changed) + ") and validated."));
         submissionRepository.flush();
-        return changed;
+        return new TieCorrection(changed, details);
+    }
+
+    private List<Map<String, Object>> changeDetails(Submission sub, EntryValidator.EntryInput in, List<String> changed) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (String field : changed) {
+            String before;
+            String after;
+            switch (field) {
+                case "word" -> {
+                    before = sub.getWrittenForm();
+                    after = in.word();
+                }
+                case "part of speech" -> {
+                    before = sub.getPartOfSpeech() == null ? null : sub.getPartOfSpeech().getCode();
+                    after = in.pos() == null ? null : in.pos().getCode();
+                }
+                case "synset linkage" -> {
+                    before = linkage(sub.getSynsetAction(), sub.getSynsetId(), sub.getIliCode());
+                    after = linkage(in.action(), in.synsetId(), in.iliCode());
+                }
+                case "definition" -> {
+                    before = definitionLabel(sub.getDefinitionLanguage(), sub.getDefinitionText());
+                    after = definitionLabel(in.definitionLanguage(), in.definitionText());
+                }
+                case "sense relations" -> {
+                    before = relationsLabel(readSense(sub.getSenseRelationsJson()).stream()
+                            .map(r -> r.relType() + " → " + r.target()).toList());
+                    after = relationsLabel(in.senseRelations().stream().map(r -> r.relType() + " → " + r.target()).toList());
+                }
+                case "synset relations" -> {
+                    before = relationsLabel(readSynset(sub.getSynsetRelationsJson()).stream()
+                            .map(r -> r.relType() + " → " + r.target()).toList());
+                    after = relationsLabel(in.synsetRelations().stream().map(r -> r.relType() + " → " + r.target()).toList());
+                }
+                case "reviewer note" -> {
+                    before = sub.getReviewerNote();
+                    after = in.reviewerNote();
+                }
+                default -> {
+                    before = null;
+                    after = null;
+                }
+            }
+            Map<String, Object> d = new LinkedHashMap<>();
+            d.put("field", field);
+            d.put("before", before);
+            d.put("after", after);
+            out.add(d);
+        }
+        return out;
+    }
+
+    private static String linkage(SynsetAction action, String synsetId, String iliCode) {
+        if (action == SynsetAction.CREATE) {
+            return "New synset" + (iliCode == null || iliCode.isBlank() ? "" : " (ILI " + iliCode + ")");
+        }
+        return synsetId == null ? null : "Linked to " + synsetId;
+    }
+
+    private static String definitionLabel(DefinitionLanguage lang, String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        return (lang == null ? "" : "[" + lang.getCode() + "] ") + text;
+    }
+
+    private static String relationsLabel(List<String> rels) {
+        return rels.isEmpty() ? null : String.join("; ", rels);
     }
 
     /** Contributor dispute of a FLAGGED / C-FLAGGED decision; opens an arbitration case. */
