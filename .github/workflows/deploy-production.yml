@@ -1,0 +1,54 @@
+name: Deploy backend to production
+
+# Runs when a release tag starting with "prod-" is pushed (e.g. by publishing a GitHub Release
+# with tag prod-1.0.0). Builds and verifies first; deploys only if that succeeds.
+on:
+  push:
+    tags: ["prod-*"]
+
+concurrency:
+  group: production-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Test and build
+        run: |
+          chmod +x gradlew
+          ./gradlew test bootJar --no-daemon
+      - name: Docker image builds
+        run: docker build -t bengali-lkc-backend:ci .
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - name: Deploy ${{ github.ref_name }} on the server
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+            "$DEPLOY_USER@$HOST" "backend ${GITHUB_REF_NAME}"

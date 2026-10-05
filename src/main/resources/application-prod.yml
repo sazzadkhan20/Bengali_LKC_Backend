@@ -21,10 +21,25 @@ server:
     include-message: never
     include-stacktrace: never
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${ACTUATOR_ENDPOINTS:health,info}
+
+springdoc:
+  api-docs:
+    enabled: ${API_DOCS_ENABLED:false}
+  swagger-ui:
+    enabled: ${API_DOCS_ENABLED:false}
+
 lkc:
   bootstrap:
-    seed-demo-users: ${SEED_DEMO_USERS:false}
-    import-lexicon-xml: ${IMPORT_LEXICON_XML:false}
+    seed-demo-users: false
+    # Loads the bundled XML only into an empty lexicon; skipped once entries exist.
+    import-lexicon-xml: ${IMPORT_LEXICON_XML:true}
+    clear-core-lexicon-before-import: false
+    lexicon-xml-path: ${LEXICON_XML_PATH:/app/data/lexicon.xml}
   mail:
     demo-expose-secrets: false
   security:

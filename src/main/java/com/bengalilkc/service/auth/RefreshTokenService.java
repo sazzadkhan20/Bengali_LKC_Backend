@@ -22,15 +22,20 @@ public class RefreshTokenService {
     private final LkcProperties properties;
     private final SecureRandom secureRandom = new SecureRandom();
 
-    /** Issues an opaque refresh token and stores only its SHA-256 hash. */
-    @Transactional
-    public String issue(String userId) {
-        String raw = UUID.randomUUID() + "." + Long.toHexString(secureRandom.nextLong());
+    /** Absolute end of a session that starts now (sign-in). Refreshing never moves it. */
+    public Instant newSessionExpiry() {
         long ttlDays = properties.getSecurity().getJwt().getRefreshTtlDays();
+        return Instant.now().plusSeconds(ttlDays * 24L * 60L * 60L);
+    }
+
+    /** Issues an opaque refresh token valid until {@code expiresAt} and stores only its SHA-256 hash. */
+    @Transactional
+    public String issue(String userId, Instant expiresAt) {
+        String raw = UUID.randomUUID() + "." + Long.toHexString(secureRandom.nextLong());
         RefreshToken entity = RefreshToken.builder()
                 .userId(userId)
                 .tokenHash(hash(raw))
-                .expiresAt(Instant.now().plusSeconds(ttlDays * 24L * 60L * 60L))
+                .expiresAt(expiresAt)
                 .revoked(false)
                 .build();
         refreshTokenRepository.save(entity);

@@ -18,6 +18,7 @@ RUN addgroup -S lkc && adduser -S lkc -G lkc \
  && chown -R lkc:lkc /app
 
 COPY --from=build /workspace/build/libs/bengali-lkc-backend.jar /app/app.jar
+COPY --chown=lkc:lkc ["Documents/Bangla Mono Lingual Lexicons.xml", "/app/data/lexicon.xml"]
 
 USER lkc
 EXPOSE 8080

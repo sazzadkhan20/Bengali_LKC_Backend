@@ -9,6 +9,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Date;
 import javax.crypto.SecretKey;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.Profiles;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -20,16 +22,27 @@ public class JwtService {
     private final LkcProperties properties;
     private final SecretKey key;
 
-    public JwtService(LkcProperties properties) {
+    public JwtService(LkcProperties properties, Environment environment) {
         this.properties = properties;
-        byte[] secretBytes = properties.getSecurity().getJwt().getSecret().getBytes(StandardCharsets.UTF_8);
+        String secret = properties.getSecurity().getJwt().getSecret();
+        if (environment.acceptsProfiles(Profiles.of("prod"))
+                && (secret == null || secret.length() < 32 || secret.contains("DevOnly"))) {
+            throw new IllegalStateException(
+                    "JWT_SECRET must be set to a private random value (at least 32 characters) in production.");
+        }
+        byte[] secretBytes = secret.getBytes(StandardCharsets.UTF_8);
         this.key = Keys.hmacShaKeyFor(secretBytes);
     }
 
     public String createAccessToken(
             String userId, String username, Role role, boolean mustChangePassword, long ttlMinutes) {
+        return createAccessToken(
+                userId, username, role, mustChangePassword, Instant.now().plusSeconds(Math.max(ttlMinutes, 1) * 60));
+    }
+
+    public String createAccessToken(
+            String userId, String username, Role role, boolean mustChangePassword, Instant exp) {
         Instant now = Instant.now();
-        Instant exp = now.plusSeconds(Math.max(ttlMinutes, 1) * 60);
         return Jwts.builder()
                 .issuer(properties.getSecurity().getJwt().getIssuer())
                 .subject(userId)

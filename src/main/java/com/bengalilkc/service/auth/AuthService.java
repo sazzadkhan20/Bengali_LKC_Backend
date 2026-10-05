@@ -108,7 +108,7 @@ public class AuthService {
 
         // One refresh session per login — revoke prior refresh tokens for this account.
         refreshTokenService.revokeAllForUser(user.getId());
-        return issueAuthResponse(user, credential, response);
+        return issueAuthResponse(user, credential, response, refreshTokenService.newSessionExpiry());
     }
 
     /** Resolve login credential by username (credential or user) or by registered email. */
@@ -133,9 +133,10 @@ public class AuthService {
             throw ApiException.unauthorized("Account is not eligible for token refresh.");
         }
 
-        // Rotate refresh token (reuse detection / theft mitigation).
+        // Rotate refresh token (reuse detection / theft mitigation). The replacement inherits the
+        // original expiry so a session ends a fixed time after sign-in, however active the user is.
         refreshTokenService.revoke(rawRefresh);
-        return issueAuthResponse(user, credential, response);
+        return issueAuthResponse(user, credential, response, stored.getExpiresAt());
     }
 
     public Map<String, Object> logout(HttpServletRequest request, HttpServletResponse response) {
@@ -250,7 +251,8 @@ public class AuthService {
 
         AppUser user = userRepository.findById(principal.getId()).orElseThrow();
         refreshTokenService.revokeAllForUser(user.getId());
-        Map<String, Object> body = issueAuthResponse(user, credential, response);
+        Map<String, Object> body =
+                issueAuthResponse(user, credential, response, refreshTokenService.newSessionExpiry());
         body.put("ok", true);
         return body;
     }
@@ -405,21 +407,31 @@ public class AuthService {
     }
 
     private Map<String, Object> issueAuthResponse(
-            AppUser user, Credential credential, HttpServletResponse response) {
-        long ttlMinutes = accessTtlMinutes();
+            AppUser user, Credential credential, HttpServletResponse response, Instant sessionExpiresAt) {
+        Instant now = Instant.now();
         boolean mustChange = credential.isOneTime();
+        Instant accessExpiresAt = now.plusSeconds(accessTtlMinutes() * 60);
+        if (accessExpiresAt.isAfter(sessionExpiresAt)) {
+            accessExpiresAt = sessionExpiresAt;
+        }
         String accessToken = jwtService.createAccessToken(
-                user.getId(), user.getUsername(), user.getRole(), mustChange, ttlMinutes);
-        String refreshToken = refreshTokenService.issue(user.getId());
-        Instant expiresAt = Instant.now().plusSeconds(ttlMinutes * 60);
+                user.getId(), user.getUsername(), user.getRole(), mustChange, accessExpiresAt);
+        String refreshToken = refreshTokenService.issue(user.getId(), sessionExpiresAt);
 
-        setAccessCookie(response, accessToken, ttlMinutes * 60L);
-        setRefreshCookie(
-                response,
-                refreshToken,
-                properties.getSecurity().getJwt().getRefreshTtlDays() * 24L * 60L * 60L);
+        setAccessCookie(response, accessToken, secondsUntil(accessExpiresAt));
+        setRefreshCookie(response, refreshToken, secondsUntil(sessionExpiresAt));
 
-        return buildSessionPayload(user, credential, mustChange, expiresAt, accessToken, refreshToken);
+        Map<String, Object> body =
+                buildSessionPayload(user, credential, mustChange, accessExpiresAt, accessToken, refreshToken);
+        body.put("refreshExpiresIn", secondsUntil(sessionExpiresAt));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> session = (Map<String, Object>) body.get("session");
+        session.put("sessionExpiresAt", sessionExpiresAt.toString());
+        return body;
+    }
+
+    private static long secondsUntil(Instant instant) {
+        return Math.max(1, instant.getEpochSecond() - Instant.now().getEpochSecond());
     }
 
     private Map<String, Object> buildSessionPayload(
@@ -463,7 +475,7 @@ public class AuthService {
         if (accessToken != null) {
             body.put("accessToken", accessToken);
             body.put("tokenType", "Bearer");
-            body.put("expiresIn", accessTtlMinutes() * 60L);
+            body.put("expiresIn", Math.max(1, expiresAt.getEpochSecond() - Instant.now().getEpochSecond()));
         }
         if (refreshToken != null) {
             body.put("refreshToken", refreshToken);

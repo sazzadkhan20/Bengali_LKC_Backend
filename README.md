@@ -154,13 +154,18 @@ Use `credentials: 'include'` on `fetch` so the httpOnly session cookie is sent.
 
 ## Production notes
 
+Step-by-step server setup, automatic deploys from `prod-*` release tags, backups and rollback:
+see [DEPLOYMENT.md](DEPLOYMENT.md). The production stack lives in [`deploy/`](deploy/).
+
 - Profile: `SPRING_PROFILES_ACTIVE=prod`
-- Set a strong `JWT_SECRET` (≥ 32 chars)
+- Set a strong, private `JWT_SECRET` (≥ 32 chars). The `prod` profile refuses to start with a missing, short or development secret.
+- Sessions end `JWT_REFRESH_TTL_DAYS` (default 7) days after sign-in. Token refreshes keep that deadline, so users must sign in again once it passes; changing the password starts a new session.
 - Set `CORS_ORIGINS` to your real frontend origin(s)
 - Set `SEED_DEMO_USERS=false` and `DEMO_EXPOSE_SECRETS=false`
 - Terminate TLS at nginx/Apache (SRS §12.3); keep cookies `Secure` + `SameSite=None` when cross-site
 - Database migrations apply automatically via Flyway on startup
-- Healthcheck: `/actuator/health`
+- Healthcheck: `/actuator/health`. Only `health,info` are exposed by default; override with `ACTUATOR_ENDPOINTS`.
+- Swagger UI and `/v3/api-docs` are off in `prod`; set `API_DOCS_ENABLED=true` to turn them on.
 
 ---
 
