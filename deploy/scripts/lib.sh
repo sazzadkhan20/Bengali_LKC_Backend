@@ -23,6 +23,8 @@ dc() {
     "$@"
 }
 
+env_get() { grep -E "^$1=" "$ENV_FILE" | tail -n1 | cut -d= -f2- | tr -d "'\"" || true; }
+
 release_get() { grep -E "^$1=" "$RELEASE_FILE" | tail -n1 | cut -d= -f2- || true; }
 
 release_set() {
@@ -35,7 +37,7 @@ release_set() {
 
 # Waits until the service's container health check reports healthy.
 wait_healthy() {
-  local service="$1" timeout="${2:-420}" waited=0 id status restarts
+  local service="$1" timeout="${2:-600}" waited=0 id status restarts
   while (( waited < timeout )); do
     id="$(dc ps -aq "$service" 2>/dev/null || true)"
     if [[ -n "$id" ]]; then
