@@ -7,6 +7,10 @@
 # Only nginx is published. Postgres, the API and the Next.js server are reachable only on the
 # private `internal` network. The Postgres and certificate volumes are `external`, so no compose
 # command (not even `down -v`) can delete them.
+#
+# Images are built by GitHub Actions and pulled from IMAGE_REGISTRY. Memory settings are sized for
+# a 1 GB server with swap; raise them in .env (BACKEND_JAVA_OPTS, FRONTEND_NODE_OPTIONS,
+# DB_POOL_SIZE) on a bigger server.
 
 name: bengali-lkc-prod
 
@@ -20,6 +24,18 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - max_connections=40
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
@@ -38,7 +54,7 @@ services:
     logging: *logging
 
   backend:
-    image: bengali-lkc-backend:${BACKEND_TAG:-none}
+    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/bengali-lkc-backend:${BACKEND_TAG:-none}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -46,11 +62,13 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: prod
       SERVER_PORT: 8080
+      SERVER_TOMCAT_THREADS_MAX: ${BACKEND_MAX_THREADS:-50}
       TZ: Asia/Dhaka
-      JAVA_OPTS: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=70.0"
+      JAVA_OPTS: ${BACKEND_JAVA_OPTS:--XX:+UseSerialGC -Xms128m -Xmx320m -XX:MaxMetaspaceSize=192m -XX:ReservedCodeCacheSize=64m -Xss512k -Djava.security.egd=file:/dev/./urandom}
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       DB_USERNAME: ${POSTGRES_USER}
       DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-8}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       CORS_ORIGINS: https://${DOMAIN:?set DOMAIN in .env}
       MAIL_HOST: ${MAIL_HOST:-smtp.gmail.com}
@@ -70,18 +88,19 @@ services:
       interval: 15s
       timeout: 5s
       retries: 8
-      # The first boot imports the lexicon XML.
-      start_period: 180s
+      # The first boot imports the lexicon XML; a 1 GB server needs the extra time.
+      start_period: 400s
     networks: [internal]
     logging: *logging
 
   frontend:
-    image: bengali-lkc-frontend:${FRONTEND_TAG:-none}
+    image: ${IMAGE_REGISTRY:?set IMAGE_REGISTRY in .env}/bengali-lkc-frontend:${FRONTEND_TAG:-none}
     restart: unless-stopped
     depends_on:
       - backend
     environment:
       BACKEND_API_URL: http://backend:8080
+      NODE_OPTIONS: ${FRONTEND_NODE_OPTIONS:---max-old-space-size=256}
       TZ: Asia/Dhaka
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ > /dev/null || exit 1"]

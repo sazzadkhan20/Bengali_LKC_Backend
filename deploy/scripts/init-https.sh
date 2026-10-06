@@ -4,8 +4,8 @@
 # Renewal is automatic afterwards (certbot service + nginx reload).
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-DOMAIN="$(grep -E '^DOMAIN=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
-EMAIL="$(grep -E '^LETSENCRYPT_EMAIL=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
+DOMAIN="$(env_get DOMAIN)"
+EMAIL="$(env_get LETSENCRYPT_EMAIL)"
 [[ -n "$DOMAIN" && -n "$EMAIL" ]] || die "set DOMAIN and LETSENCRYPT_EMAIL in $ENV_FILE"
 
 if cert_exists; then

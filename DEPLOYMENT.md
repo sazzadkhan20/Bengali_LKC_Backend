@@ -1,7 +1,8 @@
 # Bengali LKC — Production Deployment Guide
 
-A step-by-step guide for putting Bengali LKC on a free Oracle Cloud server, with HTTPS, automatic
-deploys from GitHub release tags, daily backups and data that survives every redeploy.
+A step-by-step guide for putting Bengali LKC on a free **Azure for Students** server (no credit
+card), with HTTPS, automatic deploys from GitHub release tags, daily backups and data that survives
+every redeploy.
 
 Follow the parts in order the first time. After that you only need [Part 9](#part-9--releasing-a-new-version-everyday-work).
 
@@ -13,17 +14,21 @@ Follow the parts in order the first time. After that you only need [Part 9](#par
              You publish a GitHub Release with tag  prod-1.2.0
                                    |
                                    v
-     GitHub Actions (in the repo you tagged): build + checks must pass
+   GitHub Actions (in the repo you tagged): checks -> build Docker image
+                 -> push it to GitHub Container Registry (ghcr.io, private)
                                    |
                                    v
            SSH to the server (key can ONLY run the deploy script)
                                    |
                                    v
- deploy.sh: build image -> back up DB -> switch ONE service -> health check
+ deploy.sh: pull image -> back up DB -> switch ONE service -> health check
                                    |                  | fails
                                    v                  v
                                  Live         automatic rollback
 ```
+
+Images are built on GitHub, not on the server: the free server has 1 GB of memory, enough to run
+the site but not to build it.
 
 What runs on the one server (`deploy/compose.prod.yaml`):
 
@@ -59,10 +64,14 @@ Folder layout on the server:
 ├── release.env       which tag of each service is live (written by deploy.sh)
 ├── deploy/           compose file, nginx config, scripts (copied from backend repo)
 ├── backend/          git clone of Bengali_LKC_Backend (read-only deploy key)
-├── frontend/         git clone of Bengali_LKC_Frontend (read-only deploy key)
 ├── backups/          database dumps
 └── deploy-history.log
 ```
+
+**What it costs:** the server (`B2ats_v2`, 750 free hours/month) and its 64 GB disk are free for
+12 months, renewable each year while you are a student. The fixed public IP costs about
+$3.65/month, paid from the $100 student credit. GitHub Actions and the container registry are
+free.
 
 ---
 
@@ -74,30 +83,79 @@ Folder layout on the server:
 
 ---
 
-## Part 2 — Create the Oracle Cloud server
+## Part 2 — Create the Azure server
 
-1. Sign up at <https://www.oracle.com/cloud/free/>. Pick your **home region** carefully (e.g.
-   Singapore or Mumbai, the closest to Bangladesh); Always Free servers can only be created there.
-2. Console → **Compute → Instances → Create instance**:
-   - **Name:** `bengali-lkc`
-   - **Image:** Canonical **Ubuntu 24.04** (the aarch64/ARM build)
-   - **Shape:** *Change shape → Ampere → VM.Standard.A1.Flex*, **2 OCPU, 12 GB memory**
-     (shows "Always Free eligible").
-   - **Networking:** create a new VCN with a **public subnet**, and tick **Assign a public IPv4 address**.
-   - **SSH keys:** *Generate a key pair for me* → **download the private key** (keep it safe;
-     e.g. save as `C:\Users\<you>\.ssh\oracle-lkc.key`).
-   - **Boot volume:** 100 GB is still free (default 47 GB also works).
-   - If you get "Out of capacity", try again later or pick another availability domain.
-3. Make the IP permanent: Instance → **Attached VNICs → VNIC → IPv4 Addresses → Edit** →
-   *Reserved public IP* → create one. Note the IP (example below: `152.67.10.20`).
-4. Open the web ports: Instance → **Subnet → Default Security List → Add Ingress Rules**:
-   - Source `0.0.0.0/0`, TCP, destination port **80**
-   - Source `0.0.0.0/0`, TCP, destination port **443**
+### 2.1 Activate Azure for Students (no card)
 
-   Port 22 (SSH) is already open. Do **not** open 3000, 8080 or 5432.
-5. Recommended: upgrade the account to *Pay As You Go*. Always Free resources stay free, and
-   Oracle stops reclaiming "idle" free servers. Then set a **budget alert** (Billing → Budgets)
-   of $1 so you get an email if anything ever costs money.
+1. Open <https://azure.microsoft.com/free/students> → **Start free**.
+2. Sign in with a Microsoft account (or create one), enter your **university email** and click
+   the link in the verification mail. Verify your phone by SMS. No card is asked.
+3. You land in the **Azure Portal** (<https://portal.azure.com>). Search **Education** in the
+   top bar to see your $100 credit.
+
+### 2.2 Create the virtual machine
+
+Portal → search **Virtual machines** → **Create** → **Azure virtual machine**.
+
+**Basics tab**
+
+| Field | Value |
+|-------|-------|
+| Subscription | Azure for Students |
+| Resource group | *Create new* → `bengali-lkc-rg` |
+| Virtual machine name | `bengali-lkc` |
+| Region | **(Asia Pacific) Central India** (or South India / Southeast Asia) |
+| Availability options | No infrastructure redundancy required |
+| Security type | Trusted launch virtual machines (default) |
+| Image | **Ubuntu Server 24.04 LTS - x64 Gen2** |
+| VM architecture | **x64** |
+| Size | *See all sizes* → search `B2ats_v2` → **Standard_B2ats_v2** (2 vCPU, 1 GiB) → Select |
+| Authentication type | SSH public key |
+| Username | `ubuntu` |
+| SSH public key source | Generate new key pair |
+| Key pair name | `bengali-lkc-key` |
+| Public inbound ports | Allow selected ports |
+| Select inbound ports | **SSH (22), HTTP (80), HTTPS (443)** |
+
+The size must be exactly **Standard_B2ats_v2**; other sizes use up the credit. If it is not
+offered in a region (or the region is refused for student accounts), choose another region.
+
+**Disks tab**
+
+- OS disk size: **64 GiB (P6)**
+- OS disk type: **Premium SSD (locally-redundant storage)**
+- Do not add data disks (they are not free).
+
+**Networking tab**
+
+- Virtual network / Subnet: keep the new defaults.
+- Public IP: keep the new one (it is *Standard*, which is always **static**, so it never changes).
+- NIC network security group: Basic; inbound ports 22, 80, 443 (from the Basics tab).
+- Leave **Delete public IP and NIC when VM is deleted** unticked.
+
+**Management tab**
+
+- **Auto-shutdown: make sure it is OFF.** If it is on, the site goes offline every evening.
+
+Keep the other tabs at their defaults → **Review + create** → **Create**.
+
+A pop-up offers the key: click **Download private key and create resource**. You get
+`bengali-lkc-key.pem`. **Azure never shows this key again**, so:
+
+1. Create the folder `C:\Users\<you>\.ssh` if it does not exist.
+2. Move the file there as `C:\Users\<you>\.ssh\bengali-lkc.pem`.
+3. Keep a second copy somewhere safe (e.g. a USB drive).
+
+Wait for **Your deployment is complete** → **Go to resource**. On the **Overview** page note the
+**Public IP address** (the examples below use `20.193.10.20`).
+
+Do **not** open 3000, 8080 or 5432 in the network security group.
+
+### 2.3 Watch the credit
+
+Portal → **Education** shows the remaining credit. Check it once a month; it should only go down
+by about $4 (the public IP). If it drops faster, something other than the free VM and disk is
+running.
 
 ---
 
@@ -107,7 +165,7 @@ HTTPS is required (login cookies are `Secure`), and certificates need a domain n
 
 1. Go to <https://www.duckdns.org>, sign in with GitHub or Google.
 2. Add a subdomain, e.g. `benlkc` → you get `benlkc.duckdns.org`.
-3. Set **current ip** to your reserved Oracle IP and press **update ip**.
+3. Set **current ip** to your Azure public IP and press **update ip**.
 4. Check from your PC: `nslookup benlkc.duckdns.org` shows that IP.
 
 ---
@@ -119,11 +177,11 @@ HTTPS is required (login cookies are `Secure`), and certificates need a domain n
 From Git Bash on your PC:
 
 ```bash
-chmod 600 ~/.ssh/oracle-lkc.key
-ssh -i ~/.ssh/oracle-lkc.key ubuntu@152.67.10.20
+chmod 600 ~/.ssh/bengali-lkc.pem
+ssh -i ~/.ssh/bengali-lkc.pem ubuntu@20.193.10.20
 ```
 
-Everything below runs **on the server**.
+Answer `yes` to the fingerprint question. Everything below runs **on the server**.
 
 ### 4.2 Update, timezone and basic tools
 
@@ -134,15 +192,23 @@ sudo apt -y install git rsync curl ca-certificates unattended-upgrades
 sudo reboot        # wait a minute, then ssh in again
 ```
 
-### 4.3 Open ports 80/443 in the server firewall
+### 4.3 Add swap (needed on a 1 GB server)
 
-Oracle's Ubuntu image blocks everything except SSH in its own firewall:
+Swap lets the server use part of the disk as extra memory, so the four services fit in 1 GB.
 
 ```bash
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
-sudo netfilter-persistent save
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+echo 'vm.swappiness=20' | sudo tee /etc/sysctl.d/99-lkc-swap.conf
+sudo sysctl --system
+free -h            # "Swap:" should show 4.0Gi
 ```
+
+Ports 80/443 are already open (Azure network security group, Part 2.2); Ubuntu's own firewall is
+off on Azure, so nothing else is needed.
 
 ### 4.4 Install Docker
 
@@ -171,45 +237,54 @@ sudo chown -R deploy:deploy /opt/bengali-lkc
 sudo -iu deploy          # you are now "deploy"; the rest of Part 4 runs as deploy
 ```
 
-### 4.6 Read-only access to your private GitHub repos (deploy keys)
+### 4.6 Read-only access to the backend repo (deploy key)
+
+The server only needs the backend repo (for the `deploy/` folder). The website itself arrives as
+Docker images.
 
 ```bash
-ssh-keygen -t ed25519 -N "" -f ~/.ssh/github_backend  -C "lkc-server-backend"
-ssh-keygen -t ed25519 -N "" -f ~/.ssh/github_frontend -C "lkc-server-frontend"
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/github_backend -C "lkc-server-backend"
 cat > ~/.ssh/config <<'EOF'
 Host github-backend
   HostName github.com
   User git
   IdentityFile ~/.ssh/github_backend
   IdentitiesOnly yes
-Host github-frontend
-  HostName github.com
-  User git
-  IdentityFile ~/.ssh/github_frontend
-  IdentitiesOnly yes
 EOF
 chmod 600 ~/.ssh/config
 ssh-keyscan github.com >> ~/.ssh/known_hosts
 cat ~/.ssh/github_backend.pub     # copy this line
-cat ~/.ssh/github_frontend.pub    # and this one
 ```
 
-On GitHub:
+On GitHub: **Bengali_LKC_Backend** → Settings → **Deploy keys** → *Add deploy key* → title
+`lkc-server`, paste the line, leave **Allow write access unticked** → *Add key*.
 
-- **Bengali_LKC_Backend** → Settings → **Deploy keys** → *Add deploy key* → title `lkc-server`,
-  paste `github_backend.pub`, leave **Allow write access unticked**.
-- **Bengali_LKC_Frontend** → same, with `github_frontend.pub`.
-
-Clone both repos:
+Clone it:
 
 ```bash
 cd /opt/bengali-lkc
 git clone git@github-backend:sazzadkhan20/Bengali_LKC_Backend.git backend
-git clone git@github-frontend:sazzadkhan20/Bengali_LKC_Frontend.git frontend
 rsync -a backend/deploy/ deploy/
 ```
 
-### 4.7 Create the secrets file
+### 4.7 Let the server download your private images (GitHub token)
+
+1. On GitHub (your account, not a repo): profile picture → **Settings** → **Developer settings**
+   → **Personal access tokens** → **Tokens (classic)** → **Generate new token (classic)**.
+2. Note: `lkc-server-pull`. Expiration: **No expiration** (or 1 year, and repeat this step when
+   it expires). Tick **only `read:packages`**. → **Generate token** and copy it (starts with
+   `ghp_`).
+3. On the server, as `deploy`:
+
+   ```bash
+   docker login ghcr.io -u sazzadkhan20
+   # Password: paste the token (nothing is shown while pasting), press Enter
+   # -> "Login Succeeded"
+   ```
+
+This token can only download packages; it cannot change any code.
+
+### 4.8 Create the secrets file
 
 ```bash
 cp /opt/bengali-lkc/deploy/.env.example /opt/bengali-lkc/.env
@@ -224,6 +299,7 @@ Fill in every value. For you this means:
 ```env
 DOMAIN=benlkc.duckdns.org
 LETSENCRYPT_EMAIL=benlkc2026@gmail.com
+IMAGE_REGISTRY=ghcr.io/sazzadkhan20
 POSTGRES_DB=bengali_lkc
 POSTGRES_USER=lkc_admin
 POSTGRES_PASSWORD=<first openssl output>
@@ -246,7 +322,7 @@ Save with `Ctrl+O`, `Enter`, `Ctrl+X`.
 The Gmail app password is created at <https://myaccount.google.com/apppasswords> (2-Step
 Verification must be on).
 
-### 4.8 Create the permanent volumes
+### 4.9 Create the permanent volumes
 
 ```bash
 docker volume create bengali-lkc-pgdata
@@ -272,7 +348,7 @@ cat ~/ci_deploy_key                      # private key -> GitHub secret (next st
 For the known-hosts value, run this **on your PC** (it records the server's identity):
 
 ```bash
-ssh-keyscan 152.67.10.20
+ssh-keyscan 20.193.10.20
 ```
 
 ### 5.2 Add secrets in BOTH repos
@@ -282,10 +358,10 @@ Inside it, under **Environment secrets**, add:
 
 | Name                 | Value                                              |
 |----------------------|----------------------------------------------------|
-| `DEPLOY_HOST`        | `152.67.10.20` (your reserved IP)                  |
+| `DEPLOY_HOST`        | `20.193.10.20` (your Azure public IP)              |
 | `DEPLOY_USER`        | `deploy`                                           |
 | `DEPLOY_SSH_KEY`     | whole content of `~/ci_deploy_key` (incl. BEGIN/END lines) |
-| `DEPLOY_KNOWN_HOSTS` | the full output of `ssh-keyscan 152.67.10.20`      |
+| `DEPLOY_KNOWN_HOSTS` | the full output of `ssh-keyscan 20.193.10.20`      |
 
 Under **Environment variables** add `PRODUCTION_URL` = `https://benlkc.duckdns.org`.
 
@@ -295,6 +371,8 @@ your click.
 Do this for **Bengali_LKC_Backend** and **Bengali_LKC_Frontend**. Then delete the private key
 from the server: `rm ~/ci_deploy_key`.
 
+The workflows push images with GitHub's built-in token, so no extra secret is needed for that.
+
 ---
 
 ## Part 6 — First release
@@ -302,8 +380,9 @@ from the server: `rm ~/ci_deploy_key`.
 1. **Backend first.** GitHub → Bengali_LKC_Backend → **Releases → Draft a new release** →
    *Choose a tag* → type `prod-1.0.0` → *Create new tag on publish*, target `main` →
    title `prod-1.0.0` → **Publish release**.
-2. Open the **Actions** tab and watch "Deploy backend to production". The first run takes
-   around 10–15 minutes (Docker images build on the server, and the lexicon is imported once).
+2. Open the **Actions** tab and watch "Deploy backend to production" (jobs: verify → image →
+   deploy). The first run takes around 15–20 minutes: the image is built on GitHub, and the
+   lexicon is imported once on the server.
 3. **Then the frontend:** same steps in Bengali_LKC_Frontend with tag `prod-1.0.0`.
 4. When both are green, turn on HTTPS once (on the server, as `deploy`):
 
@@ -319,8 +398,9 @@ Then:
 - Optionally remove the `LKC_INITIAL_ARCHITECT_PASSWORD` line from `/opt/bengali-lkc/.env`; it
   is only read on the very first start.
 
-> If a workflow fails, open the failed step to read the log. You can always run the same
-> deployment by hand on the server: `bash /opt/bengali-lkc/deploy/scripts/deploy.sh backend prod-1.0.0`
+> If a workflow fails, open the failed step to read the log. Once the image job has succeeded,
+> you can always run the same deployment by hand on the server:
+> `bash /opt/bengali-lkc/deploy/scripts/deploy.sh backend prod-1.0.0`
 
 ---
 
@@ -342,10 +422,9 @@ Backups older than 14 days are deleted automatically. **Copy backups off the ser
 regularly, e.g. weekly from your PC:
 
 ```bash
-scp -i ~/.ssh/oracle-lkc.key "ubuntu@152.67.10.20:/opt/bengali-lkc/backups/*.dump" ./lkc-backups/
+mkdir -p ./lkc-backups
+scp -i ~/.ssh/bengali-lkc.pem "ubuntu@20.193.10.20:/opt/bengali-lkc/backups/*.dump" ./lkc-backups/
 ```
-
-(Later you can upload them to Oracle Object Storage, 20 GB free.)
 
 **Test a restore** once, so you know it works:
 
@@ -357,14 +436,13 @@ bash /opt/bengali-lkc/deploy/scripts/restore-db.sh /opt/bengali-lkc/backups/<fil
 
 ## Part 8 — Checking on the server
 
-As `deploy` on the server:
+As `deploy` on the server (`ssh` in as `ubuntu`, then `sudo -iu deploy`):
 
 ```bash
-bash /opt/bengali-lkc/deploy/scripts/status.sh     # live tags, containers, deploys, backups, disk
+bash /opt/bengali-lkc/deploy/scripts/status.sh     # live tags, containers, deploys, backups, memory, disk
 cd /opt/bengali-lkc/deploy
 docker compose -f compose.prod.yaml --env-file ../.env --env-file ../release.env logs -f backend
 docker stats                                         # CPU / memory per container
-df -h /                                              # disk
 ```
 
 The site's health endpoint is internal; `status.sh` shows each container as `healthy`.
@@ -378,7 +456,7 @@ The site's health endpoint is internal; `status.sh` shows each container as `hea
    - backend change → Bengali_LKC_Backend release `prod-1.1.0`
    - frontend change → Bengali_LKC_Frontend release `prod-1.1.0`
    - both changed → backend first (wait for green), then frontend
-3. Watch the Actions run. Only that service restarts (a few seconds of downtime). All users,
+3. Watch the Actions run. Only that service restarts (under a minute of downtime). All users,
    entries, submissions and other data stay exactly as they were.
 
 Tag names must start with `prod-` and may not be reused. Use increasing versions:
@@ -405,7 +483,8 @@ Tag names must start with `prod-` and may not be reused. Use increasing versions
   bash /opt/bengali-lkc/deploy/scripts/deploy.sh backend prod-1.0.0
   ```
 
-  The last three images of each service are kept, so this takes seconds.
+  The last three images of each service stay on the server, so this takes seconds; older ones
+  are downloaded again from ghcr.io.
 - **Manual (data):** restore a backup with `restore-db.sh` (Part 7). Only do this for real data
   problems: it replaces everything written since that backup.
 
@@ -419,7 +498,8 @@ migrations it does not know about. That is one more reason to keep migrations ad
 - `docker compose down -v`, `docker volume rm bengali-lkc-pgdata`, `docker system prune -a --volumes`
 - Change `POSTGRES_PASSWORD` in `.env` after the first start
 - Edit or delete released files in `src/main/resources/db/migration/`
-- Open ports 3000, 8080 or 5432 in Oracle or the firewall
+- Open ports 3000, 8080 or 5432 in the Azure network security group
+- Resize the VM to another size (it starts using the credit) or turn on auto-shutdown
 - Commit `.env` or any password to git
 
 ---
@@ -428,11 +508,14 @@ migrations it does not know about. That is one more reason to keep migrations ad
 
 | Symptom | What to check |
 |---------|---------------|
+| Actions `image` job: `denied` / `permission_denied` | Repo → Settings → Actions → General → Workflow permissions allows the workflow; the package (GitHub profile → Packages) is linked to this repo |
 | Actions: `Permission denied (publickey)` | `DEPLOY_SSH_KEY` copied completely; the `authorized_keys` line exists for user `deploy` |
 | Actions: `Host key verification failed` | `DEPLOY_KNOWN_HOSTS` is the output of `ssh-keyscan <IP>` |
-| Deploy: `tag prod-x not found` | Tag exists in that repo on GitHub; the server deploy key works (`ssh -T git@github-backend`) |
+| Deploy: `could not pull ghcr.io/...` | The `image` job succeeded; `docker login ghcr.io` was done **as `deploy`** (Part 4.7) and the token has not expired |
+| Deploy: `tag prod-x not found` | Tag exists in the backend repo on GitHub; the server deploy key works (`ssh -T git@github-backend`) |
 | Deploy: backend unhealthy | `status.sh`, then the backend logs (Part 8); usually a wrong value in `.env` |
-| `init-https.sh` fails | DuckDNS IP is correct; ports 80/443 open in Oracle **and** iptables (Part 4.3) |
+| Site very slow, `free -h` shows swap almost full | Run `status.sh`; restart one service by deploying its live tag again; check that swap (Part 4.3) is active |
+| `init-https.sh` fails | DuckDNS IP is correct; ports 80/443 allowed in the Azure network security group |
 | Site loads but login fails | Use `https://` (not http); `DOMAIN` in `.env` matches the address you open |
 | Emails not sent | `MAIL_USERNAME`/`MAIL_PASSWORD` (Gmail app password) in `.env`, then redeploy the backend tag |
 
@@ -441,9 +524,14 @@ After changing `.env`, apply it by deploying the current tag again:
 
 ---
 
-## Later: your own domain
+## Later: your own domain or a bigger server
 
-Buy a domain, point it (Cloudflare DNS, *DNS only* / grey cloud) at the server IP, set
-`DOMAIN=` in `.env`, delete the old certificate
-(`docker run --rm -v bengali-lkc-letsencrypt:/etc/letsencrypt alpine rm -rf /etc/letsencrypt/live/lkc /etc/letsencrypt/archive/lkc /etc/letsencrypt/renewal/lkc.conf`),
-run `init-https.sh`, redeploy the backend tag (updates CORS) and update `PRODUCTION_URL` in GitHub.
+- **Own domain:** buy a domain, point it (Cloudflare DNS, *DNS only* / grey cloud) at the server
+  IP, set `DOMAIN=` in `.env`, delete the old certificate
+  (`docker run --rm -v bengali-lkc-letsencrypt:/etc/letsencrypt alpine rm -rf /etc/letsencrypt/live/lkc /etc/letsencrypt/archive/lkc /etc/letsencrypt/renewal/lkc.conf`),
+  run `init-https.sh`, redeploy the backend tag (updates CORS) and update `PRODUCTION_URL` in GitHub.
+- **More memory:** on a bigger server set larger values in `.env`, e.g.
+  `BACKEND_JAVA_OPTS='-XX:+UseContainerSupport -XX:MaxRAMPercentage=60.0'`,
+  `FRONTEND_NODE_OPTIONS='--max-old-space-size=512'`, `DB_POOL_SIZE=20`, then redeploy both tags.
+- **ARM server** (e.g. Oracle Ampere): add the repository variable `IMAGE_PLATFORMS` =
+  `linux/arm64` in both repos so the images are built for ARM.
