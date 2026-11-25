@@ -241,8 +241,8 @@ public class EntryValidator {
             }
             String name = SynsetDefinitionService.languageName(lang);
             if (existingLanguages.contains(lang)) {
-                errors.put(key, "The selected synset already has a " + name
-                        + " definition. Add a definition in another language, or remove this one.");
+                errors.put(key, "The selected synset already has a definition in " + name
+                        + ". Add a definition in another language, or remove this one.");
             } else if (firstUse.containsKey(lang)) {
                 errors.put(key, "Only one definition per language: " + name + " is already used in definition "
                         + (firstUse.get(lang) + 1) + ".");
