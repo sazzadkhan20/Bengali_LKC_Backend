@@ -15,7 +15,8 @@ import com.bengalilkc.domain.enums.Role;
 import com.bengalilkc.repository.identity.AppUserRepository;
 import com.bengalilkc.repository.lexicon.SenseRepository;
 import com.bengalilkc.repository.lexicon.SynsetRepository;
-import com.bengalilkc.repository.lexicon.WordnetIliRepository;
+import com.bengalilkc.service.lexicon.SynsetDefinitionService;
+import com.bengalilkc.service.lexicon.WordnetRegistryService;
 import com.bengalilkc.repository.workflow.ArbitrationCaseRepository;
 import com.bengalilkc.security.PermissionMatrix;
 import com.bengalilkc.security.UserPrincipal;
@@ -61,7 +62,8 @@ public class SubmissionBrowseService {
     private final SynsetRepository synsetRepository;
     private final ArbitrationCaseRepository caseRepository;
     private final SenseRepository senseRepository;
-    private final WordnetIliRepository wordnetIliRepository;
+    private final WordnetRegistryService registryService;
+    private final SynsetDefinitionService definitionService;
     private final ReviewService reviewService;
 
     /**
@@ -128,20 +130,23 @@ public class SubmissionBrowseService {
                 s.put("definitionText", sy.getDefinitionText());
                 s.put("definitionLanguage",
                         sy.getDefinitionLanguage() != null ? sy.getDefinitionLanguage().getCode() : null);
+                s.put("definitions", definitionService.forSynset(sy.getId()));
                 s.put("members", lemmasBySynset(List.of(sy.getId())).getOrDefault(sy.getId(), List.of()));
                 m.put("synset", s);
                 ili = sy.getIli();
             }
         }
         if (ili != null && !ili.isBlank() && !"n/a".equalsIgnoreCase(ili)) {
-            wordnetIliRepository.findById(ili).ifPresent(w -> {
+            WordnetRegistryService.Hit w = registryService.find(ili);
+            if (w != null) {
                 Map<String, Object> i = new LinkedHashMap<>();
-                i.put("ili", w.getIli());
-                i.put("pos", w.getPos() != null ? w.getPos().getCode() : null);
-                i.put("words", w.getWordsCsv());
-                i.put("gloss", w.getGloss());
+                i.put("ili", w.ili());
+                i.put("pos", w.pos());
+                i.put("words", String.join(", ", w.words()));
+                i.put("gloss", w.gloss());
+                i.put("source", "Princeton WordNet " + WordnetRegistryService.VERSION);
                 m.put("iliInfo", i);
-            });
+            }
         }
 
         @SuppressWarnings("unchecked")
@@ -355,11 +360,11 @@ public class SubmissionBrowseService {
             params.addValue("contributorId", contributorId);
         }
         if (q != null) {
-            // Linked submissions carry no own definition, so also match the linked synset's gloss.
+            // Match every definition the entry proposes and every definition of its linked synset.
             where.append(" and (lower(s.written_form) like :like escape '!'")
-                    .append(" or lower(s.definition_text) like :like escape '!'")
-                    .append(" or s.synset_id in (select sy.id from synset sy")
-                    .append(" where lower(sy.definition_text) like :like escape '!'))");
+                    .append(" or lower(lkc_definitions_text(s.definitions_json)) like :like escape '!'")
+                    .append(" or s.synset_id in (select d.synset_id from synset_definition d")
+                    .append(" where lower(d.text) like :like escape '!'))");
             params.addValue("like", "%" + escapeLike(q.toLowerCase(Locale.ROOT)) + "%");
         }
 
@@ -509,9 +514,9 @@ public class SubmissionBrowseService {
         }
         if (q != null) {
             where.append(" and (lower(s.written_form) like :like escape '!'")
-                    .append(" or lower(s.definition_text) like :like escape '!'")
-                    .append(" or s.synset_id in (select sy.id from synset sy")
-                    .append(" where lower(sy.definition_text) like :like escape '!'))");
+                    .append(" or lower(lkc_definitions_text(s.definitions_json)) like :like escape '!'")
+                    .append(" or s.synset_id in (select d.synset_id from synset_definition d")
+                    .append(" where lower(d.text) like :like escape '!'))");
             params.addValue("like", "%" + escapeLike(q.toLowerCase(Locale.ROOT)) + "%");
         }
         String mine = """

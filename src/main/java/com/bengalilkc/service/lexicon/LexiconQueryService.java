@@ -6,13 +6,11 @@ import com.bengalilkc.domain.entity.lexicon.LexicalEntryEntity;
 import com.bengalilkc.domain.entity.lexicon.SenseEntity;
 import com.bengalilkc.domain.entity.lexicon.SynsetEntity;
 import com.bengalilkc.domain.entity.lexicon.SynsetRelationEntity;
-import com.bengalilkc.domain.entity.lexicon.WordnetIli;
 import com.bengalilkc.domain.enums.PartOfSpeech;
 import com.bengalilkc.repository.lexicon.LexicalEntryRepository;
 import com.bengalilkc.repository.lexicon.SenseRepository;
 import com.bengalilkc.repository.lexicon.SynsetRelationRepository;
 import com.bengalilkc.repository.lexicon.SynsetRepository;
-import com.bengalilkc.repository.lexicon.WordnetIliRepository;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -21,6 +19,7 @@ import java.util.Map;
 import java.util.Set;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.jdbc.core.RowCallbackHandler;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -36,29 +35,9 @@ public class LexiconQueryService {
     private final SynsetRepository synsetRepository;
     private final SenseRepository senseRepository;
     private final SynsetRelationRepository synsetRelationRepository;
-    private final WordnetIliRepository wordnetIliRepository;
+    private final WordnetRegistryService registryService;
+    private final SynsetDefinitionService definitionService;
     private final NamedParameterJdbcTemplate jdbc;
-
-    /** count(*) scans the whole table in PostgreSQL, so corpus sizes are cached briefly. */
-    private static final long COUNTS_TTL_MS = 60_000;
-
-    private volatile Map<String, Long> cachedCounts;
-    private volatile long cachedCountsAt;
-
-    private Map<String, Long> corpusCounts() {
-        Map<String, Long> c = cachedCounts;
-        if (c != null && System.currentTimeMillis() - cachedCountsAt < COUNTS_TTL_MS) {
-            return c;
-        }
-        Map<String, Long> fresh = new LinkedHashMap<>();
-        fresh.put("entries", entryRepository.count());
-        fresh.put("synsets", synsetRepository.count());
-        fresh.put("senses", senseRepository.count());
-        fresh.put("iliRegistry", wordnetIliRepository.count());
-        cachedCounts = fresh;
-        cachedCountsAt = System.currentTimeMillis();
-        return fresh;
-    }
 
     /** Sense-relation target search — by Bengali word (returns sense ids). */
     @Transactional(readOnly = true)
@@ -123,7 +102,7 @@ public class LexiconQueryService {
         if (found.size() < LOOKUP_LIMIT) {
             int need = LOOKUP_LIMIT - found.size();
             for (SynsetEntity syn :
-                    synsetRepository.searchByDefinition(query, pos, PageRequest.of(0, need + 5))) {
+                    synsetRepository.searchByDefinition(query, pos == null ? null : pos.getCode(), PageRequest.of(0, need + 5))) {
                 found.putIfAbsent(syn.getId(), syn);
                 if (found.size() >= LOOKUP_LIMIT) {
                     break;
@@ -133,47 +112,55 @@ public class LexiconQueryService {
         return Map.of("results", synsetRows(found.values()));
     }
 
+    /**
+     * ILI Finder: Princeton WordNet 3.0 synsets by English word and optional POS. Each hit says whether
+     * the concept already has a Bengali synset ({@code alreadyInBengali} + its id) or is proposed by a
+     * live submission ({@code proposedIn}); only free concepts can be used for a new synset.
+     */
     @Transactional(readOnly = true)
     public Map<String, Object> lookupIli(String word, String posParam) {
         PartOfSpeech pos = parsePos(posParam);
-        Map<String, Long> counts = corpusCounts();
+        Map<String, Object> stats = registryService.stats();
         Map<String, Object> registry = new LinkedHashMap<>();
-        registry.put("count", counts.get("iliRegistry"));
-        registry.put("synsetCount", counts.get("iliRegistry"));
-        registry.put("lemmaCount", counts.get("entries"));
-        registry.put("version", "Bengali-UKC-seeded");
-        registry.put("source", "wordnet_ili");
+        registry.put("version", WordnetRegistryService.VERSION);
+        registry.put("source", "Princeton WordNet " + WordnetRegistryService.VERSION);
+        registry.put("loaded", stats != null);
+        registry.put("synsetCount", stats != null ? stats.get("synsetCount") : 0L);
+        registry.put("lemmaCount", stats != null ? stats.get("lemmaCount") : 0L);
 
-        if (word == null || word.trim().length() < 2) {
+        if (stats == null || word == null || WordnetRegistryService.normalize(word).length() < 2) {
             return Map.of("results", List.of(), "registry", registry);
         }
-        List<WordnetIli> hits = wordnetIliRepository.searchByWord(word.trim(), pos, PageRequest.of(0, 25));
-        Set<String> mappedIlis = hits.isEmpty()
-                ? Set.of()
-                : new java.util.HashSet<>(synsetRepository.findExistingIlis(
-                        hits.stream().map(WordnetIli::getIli).toList()));
+        List<WordnetRegistryService.Hit> hits = registryService.search(word, pos, 25);
+        List<String> ilis = hits.stream().map(WordnetRegistryService.Hit::ili).toList();
+        Map<String, String> bengaliSynset = new java.util.HashMap<>();
         Map<String, String> proposedIn = new java.util.HashMap<>();
-        if (!hits.isEmpty()) {
+        if (!ilis.isEmpty()) {
+            MapSqlParameterSource args = new MapSqlParameterSource("ilis", ilis);
+            jdbc.query("""
+                    select lower(ili) as ili, min(id) as id from synset
+                    where lower(ili) in (:ilis)
+                    group by lower(ili)
+                    """, args, (RowCallbackHandler) rs -> bengaliSynset.put(rs.getString("ili"), rs.getString("id")));
             jdbc.query("""
                     select lower(ili_code) as ili, min(id) as id from submission
                     where synset_action = 'create' and state <> 'REJECTED' and promoted_synset_id is null
                       and lower(ili_code) in (:ilis)
                     group by lower(ili_code)
-                    """,
-                    new MapSqlParameterSource("ilis", hits.stream().map(h -> h.getIli().toLowerCase()).toList()),
-                    (org.springframework.jdbc.core.RowCallbackHandler) rs -> proposedIn.put(rs.getString("ili"), rs.getString("id")));
+                    """, args, (RowCallbackHandler) rs -> proposedIn.put(rs.getString("ili"), rs.getString("id")));
         }
         List<Map<String, Object>> results = new ArrayList<>();
-        for (WordnetIli w : hits) {
+        for (WordnetRegistryService.Hit h : hits) {
             Map<String, Object> row = new LinkedHashMap<>();
-            row.put("ili", w.getIli());
-            row.put("pos", w.getPos().getCode());
-            row.put("words", w.getWordsCsv() != null ? List.of(w.getWordsCsv().split(",")) : List.of());
-            row.put("gloss", w.getGloss());
-            boolean mapped = mappedIlis.contains(w.getIli());
-            row.put("alreadyMapped", mapped);
-            row.put("alreadyInBengali", mapped);
-            row.put("proposedIn", proposedIn.get(w.getIli().toLowerCase()));
+            row.put("ili", h.ili());
+            row.put("pos", h.pos());
+            row.put("words", h.words());
+            row.put("gloss", h.gloss());
+            String synsetId = bengaliSynset.get(h.ili());
+            row.put("alreadyInBengali", synsetId != null);
+            row.put("alreadyMapped", synsetId != null);
+            row.put("synsetId", synsetId);
+            row.put("proposedIn", synsetId == null ? proposedIn.get(h.ili()) : null);
             results.add(row);
         }
         return Map.of("results", results, "registry", registry);
@@ -192,6 +179,8 @@ public class LexiconQueryService {
                 w.add((String) r[1]);
             }
         }
+        Map<String, List<Map<String, Object>>> definitions =
+                definitionService.bySynsetIds(synsets.stream().map(SynsetEntity::getId).toList());
         List<Map<String, Object>> rows = new ArrayList<>(synsets.size());
         for (SynsetEntity syn : synsets) {
             Map<String, Object> row = new LinkedHashMap<>();
@@ -199,6 +188,7 @@ public class LexiconQueryService {
             row.put("ili", syn.getIli());
             row.put("pos", syn.getPartOfSpeech().getCode());
             row.put("definition", truncate(syn.getDefinitionText(), 110));
+            row.put("definitions", definitions.getOrDefault(syn.getId(), List.of()));
             row.put("words", List.copyOf(wordsBySynset.getOrDefault(syn.getId(), Set.of())));
             row.put("origin", syn.getOrigin() != null ? syn.getOrigin() : "XML");
             rows.add(row);

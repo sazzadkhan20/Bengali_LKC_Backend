@@ -63,9 +63,12 @@ public class LexiconValidationService {
         } else if (!"n/a".equals(ili) && pos != null && !ili.endsWith("-" + pos.getCode())) {
             errors.put("iliCode", "The ILI code's POS suffix must match the selected part of speech.");
         } else if (!"n/a".equals(ili)) {
-            String taken = entryValidator.iliTaken(ili, null);
-            if (taken != null) {
-                errors.put("iliCode", taken);
+            String problem = entryValidator.iliRegistryError(ili);
+            if (problem == null) {
+                problem = entryValidator.iliTaken(ili, null);
+            }
+            if (problem != null) {
+                errors.put("iliCode", problem);
             }
         }
         Map<String, Object> out = new LinkedHashMap<>();

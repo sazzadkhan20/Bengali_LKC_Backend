@@ -10,6 +10,7 @@ import com.bengalilkc.domain.enums.SynsetAction;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.IdGeneratorService;
 import com.bengalilkc.service.lexicon.LexiconStatsService;
+import com.bengalilkc.service.lexicon.SynsetDefinitionService;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -37,6 +38,7 @@ public class LexiconPromotionService {
     private final EntryValidator validator;
     private final AuditService auditService;
     private final LexiconStatsService statsService;
+    private final SynsetDefinitionService definitionService;
 
     public void promote(Submission sub, String actorId, String actorRole) {
         if (isPromoted(sub.getId())) {
@@ -55,18 +57,15 @@ public class LexiconPromotionService {
         if (sub.getSynsetAction() == SynsetAction.LINK) {
             synsetId = sub.getSynsetId();
             List<Map<String, Object>> syn = jdbc.queryForList(
-                    "select id, definition_text from synset where id = :id", Map.of("id", synsetId == null ? "" : synsetId));
+                    "select id from synset where id = :id", Map.of("id", synsetId == null ? "" : synsetId));
             if (syn.isEmpty()) {
                 throw ApiException.conflict("Cannot validate " + label + ": its linked synset " + synsetId
                         + " is no longer in the lexicon. Flag the entry so the contributor can relink it.");
             }
-            if (syn.get(0).get("definition_text") == null && sub.getDefinitionText() != null) {
-                jdbc.update("""
-                        update synset set definition_text = :text, definition_language = :lang, updated_at = :ts
-                        where id = :id and definition_text is null
-                        """, new MapSqlParameterSource("text", sub.getDefinitionText())
-                        .addValue("lang", sub.getDefinitionLanguage() != null ? sub.getDefinitionLanguage().getCode() : "ben")
-                        .addValue("ts", ts).addValue("id", synsetId));
+            // New definitions only for languages the synset does not have yet; existing ones stay as they are.
+            if (definitionService.insert(synsetId, definitionService.read(sub.getDefinitionsJson()), sub.getId()) > 0) {
+                jdbc.update("update synset set updated_at = :ts where id = :id",
+                        new MapSqlParameterSource("ts", ts).addValue("id", synsetId));
             }
         } else {
             String ili = sub.getIliCode() == null || EntryValidator.isNa(sub.getIliCode()) ? "n/a" : sub.getIliCode().toLowerCase();
@@ -81,16 +80,13 @@ public class LexiconPromotionService {
             }
             synsetId = nextId("synset", "ben-syn", "synset");
             jdbc.update("""
-                    insert into synset (id, lexicon_id, ili, part_of_speech, lexicalized, definition_language,
-                                        definition_text, crowdsourced, created_at, updated_at,
-                                        origin, source_submission_id, promoted_at)
-                    values (:id, :lex, :ili, :pos, true, :lang, :text, true, :ts, :ts, 'USER', :sub, :ts)
+                    insert into synset (id, lexicon_id, ili, part_of_speech, lexicalized, crowdsourced,
+                                        created_at, updated_at, origin, source_submission_id, promoted_at)
+                    values (:id, :lex, :ili, :pos, true, true, :ts, :ts, 'USER', :sub, :ts)
                     """, new MapSqlParameterSource("id", synsetId).addValue("lex", lexiconId).addValue("ili", ili)
                     .addValue("pos", pos)
-                    .addValue("lang", sub.getDefinitionText() != null && sub.getDefinitionLanguage() != null
-                            ? sub.getDefinitionLanguage().getCode() : null)
-                    .addValue("text", sub.getDefinitionText())
                     .addValue("ts", ts).addValue("sub", sub.getId()));
+            definitionService.insert(synsetId, definitionService.read(sub.getDefinitionsJson()), sub.getId());
             synsetCreated = true;
         }
 
@@ -184,6 +180,7 @@ public class LexiconPromotionService {
         }
 
         jdbc.update("delete from synset_relation where source_submission_id = :sub", p);
+        definitionService.deleteAddedBy(sub.getId());
         jdbc.update("delete from sense_relation where source_submission_id = :sub", p);
         jdbc.update("delete from sense where id = :sense", p);
         if (synsetId != null) {

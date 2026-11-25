@@ -8,7 +8,7 @@ import com.bengalilkc.domain.entity.lexicon.SenseRelationType;
 import com.bengalilkc.domain.entity.lexicon.SynsetEntity;
 import com.bengalilkc.domain.entity.lexicon.SynsetRelationEntity;
 import com.bengalilkc.domain.entity.lexicon.SynsetRelationType;
-import com.bengalilkc.domain.entity.lexicon.WordnetIli;
+import com.bengalilkc.common.DefinitionPayload;
 import com.bengalilkc.domain.enums.DefinitionLanguage;
 import com.bengalilkc.domain.enums.PartOfSpeech;
 import com.bengalilkc.repository.lexicon.LexicalEntryRepository;
@@ -19,7 +19,6 @@ import com.bengalilkc.repository.lexicon.SenseRepository;
 import com.bengalilkc.repository.lexicon.SynsetRelationRepository;
 import com.bengalilkc.repository.lexicon.SynsetRelationTypeRepository;
 import com.bengalilkc.repository.lexicon.SynsetRepository;
-import com.bengalilkc.repository.lexicon.WordnetIliRepository;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import java.io.InputStream;
@@ -59,19 +58,19 @@ public class LexiconImportService {
     private final SenseRelationTypeRepository senseRelationTypeRepository;
     private final SynsetRelationTypeRepository synsetRelationTypeRepository;
     private final LexiconRepository lexiconRepository;
-    private final WordnetIliRepository wordnetIliRepository;
+    private final SynsetDefinitionService definitionService;
 
     @PersistenceContext
     private EntityManager entityManager;
 
     /**
      * Wipe only core LKC lexicon graph data. Does <strong>not</strong> touch
-     * identity (users/credentials), workflow, community, or system_config.
+     * identity (users/credentials), workflow, community, system_config or the WordNet ILI registry.
      */
     @Transactional
     public void clearCoreLexiconData() {
-        log.warn("Clearing core lexicon tables (relations → senses → entries → synsets → wordnet_ili)");
-        entityManager.createNativeQuery("TRUNCATE TABLE sense_relation, synset_relation, sense, lexical_entry, synset, wordnet_ili RESTART IDENTITY CASCADE")
+        log.warn("Clearing core lexicon tables (relations → senses → entries → definitions → synsets)");
+        entityManager.createNativeQuery("TRUNCATE TABLE sense_relation, synset_relation, sense, lexical_entry, synset_definition, synset RESTART IDENTITY CASCADE")
                 .executeUpdate();
         entityManager.flush();
         entityManager.clear();
@@ -115,6 +114,9 @@ public class LexiconImportService {
         SenseEntity currentSense = null;
         boolean inDefinition = false;
         StringBuilder definitionText = null;
+        String definitionLanguage = null;
+        /** Every {@code <Definition>} per synset, at most one per language (the first one wins). */
+        Map<String, List<DefinitionPayload>> definitions = new LinkedHashMap<>();
 
         log.info("Parsing lexicon XML from {}", path.toAbsolutePath());
         try (InputStream in = Files.newInputStream(path)) {
@@ -198,12 +200,10 @@ public class LexiconImportService {
                         case "Definition" -> {
                             inDefinition = true;
                             definitionText = new StringBuilder();
-                            if (currentSynset != null) {
-                                String lang = attr(reader, "language");
-                                if (lang != null && !lang.isBlank()) {
-                                    currentSynset.setDefinitionLanguage(DefinitionLanguage.from(lang));
-                                }
-                            }
+                            String lang = attr(reader, "language");
+                            definitionLanguage = lang.isBlank()
+                                    ? DefinitionLanguage.BEN.getCode()
+                                    : DefinitionLanguage.from(lang).getCode();
                         }
                         case "SynsetRelation" -> {
                             if (currentSynset != null) {
@@ -243,12 +243,16 @@ public class LexiconImportService {
                         case "Definition" -> {
                             if (currentSynset != null && definitionText != null) {
                                 String text = definitionText.toString().trim();
-                                if (!text.isEmpty()) {
-                                    currentSynset.setDefinitionText(text);
+                                String language = definitionLanguage;
+                                List<DefinitionPayload> list = definitions.computeIfAbsent(
+                                        currentSynset.getId(), k -> new ArrayList<>());
+                                if (!text.isEmpty() && list.stream().noneMatch(d -> d.language().equals(language))) {
+                                    list.add(new DefinitionPayload(language, text));
                                 }
                             }
                             inDefinition = false;
                             definitionText = null;
+                            definitionLanguage = null;
                         }
                         default -> {
                         }
@@ -284,17 +288,18 @@ public class LexiconImportService {
 
         int senseRelSaved = persistSenseRelations(pendingSenseRels, senses);
         int synsetRelSaved = persistSynsetRelations(pendingSynsetRels, synsets);
-        int iliSaved = seedWordnetIliFromSynsets(synsets.values());
-
         entityManager.flush();
+        definitions.keySet().retainAll(synsets.keySet());
+        int definitionsSaved = definitionService.insertBatch(definitions);
+
         log.info(
-                "Lexicon import complete: entries={}, synsets={}, senses={}, senseRels={}, synsetRels={}, wordnetIli={}",
+                "Lexicon import complete: entries={}, synsets={}, senses={}, senseRels={}, synsetRels={}, definitions={}",
                 entries.size(),
                 synsets.size(),
                 senses.size(),
                 senseRelSaved,
                 synsetRelSaved,
-                iliSaved);
+                definitionsSaved);
 
         return new ImportStats(
                 entries.size(),
@@ -302,7 +307,7 @@ public class LexiconImportService {
                 senses.size(),
                 senseRelSaved,
                 synsetRelSaved,
-                iliSaved,
+                definitionsSaved,
                 false);
     }
 
@@ -405,25 +410,6 @@ public class LexiconImportService {
         return saved;
     }
 
-    /** Seed ILI finder registry from imported real ILI codes (not n/a). */
-    private int seedWordnetIliFromSynsets(Collection<SynsetEntity> synsets) {
-        Map<String, WordnetIli> byIli = new LinkedHashMap<>();
-        for (SynsetEntity syn : synsets) {
-            String ili = syn.getIli();
-            if (ili == null || ili.isBlank() || "n/a".equalsIgnoreCase(ili)) {
-                continue;
-            }
-            byIli.computeIfAbsent(ili, key -> WordnetIli.builder()
-                    .ili(key)
-                    .pos(syn.getPartOfSpeech())
-                    .wordsCsv(null)
-                    .gloss(syn.getDefinitionText())
-                    .build());
-        }
-        saveWordnetIlis(byIli.values());
-        return byIli.size();
-    }
-
     private void saveSynsets(Collection<SynsetEntity> entities) {
         List<SynsetEntity> list = new ArrayList<>(entities);
         for (int i = 0; i < list.size(); i += BATCH) {
@@ -454,14 +440,6 @@ public class LexiconImportService {
             if ((i / BATCH) % 10 == 0) {
                 log.info("Senses persisted {} / {}", Math.min(i + BATCH, list.size()), list.size());
             }
-        }
-    }
-
-    private void saveWordnetIlis(Collection<WordnetIli> entities) {
-        List<WordnetIli> list = new ArrayList<>(entities);
-        for (int i = 0; i < list.size(); i += BATCH) {
-            wordnetIliRepository.saveAll(list.subList(i, Math.min(i + BATCH, list.size())));
-            entityManager.flush();
         }
     }
 
@@ -515,7 +493,7 @@ public class LexiconImportService {
             int senses,
             int senseRelations,
             int synsetRelations,
-            int wordnetIlis,
+            int definitions,
             boolean skipped) {
         static ImportStats skipped(long existingEntries) {
             return new ImportStats((int) existingEntries, 0, 0, 0, 0, 0, true);

@@ -33,7 +33,8 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.flywaydb:flyway-core'
     implementation 'org.flywaydb:flyway-database-postgresql'
-    runtimeOnly 'org.postgresql:postgresql'
+    // implementation (not runtimeOnly): WordnetRegistryLoader bulk-loads the ILI registry with COPY
+    implementation 'org.postgresql:postgresql'
 
     // AOP (permission aspects)
     implementation 'org.springframework.boot:spring-boot-starter-aop'

@@ -63,11 +63,16 @@ public class Submission {
     @Column(name = "ili_code", length = 50)
     private String iliCode;
 
+    /** Legacy single-definition columns: written with the primary definition (rollback safety only). */
     @Column(name = "definition_language", length = 5)
     private DefinitionLanguage definitionLanguage;
 
     @Column(name = "definition_text", columnDefinition = "TEXT")
     private String definitionText;
+
+    /** Proposed definitions, JSON list of {@code {"language","text"}} — at most one per language. */
+    @Column(name = "definitions_json", columnDefinition = "TEXT")
+    private String definitionsJson;
 
     @Column(name = "sense_relations_json", columnDefinition = "TEXT")
     private String senseRelationsJson;

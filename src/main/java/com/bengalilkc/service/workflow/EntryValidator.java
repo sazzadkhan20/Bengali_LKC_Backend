@@ -1,6 +1,7 @@
 package com.bengalilkc.service.workflow;
 
 import com.bengalilkc.common.BengaliText;
+import com.bengalilkc.common.DefinitionPayload;
 import com.bengalilkc.common.SenseRelationPayload;
 import com.bengalilkc.common.SynsetRelationPayload;
 import com.bengalilkc.domain.entity.lexicon.SynsetEntity;
@@ -9,6 +10,8 @@ import com.bengalilkc.domain.enums.EntryState;
 import com.bengalilkc.domain.enums.PartOfSpeech;
 import com.bengalilkc.domain.enums.SynsetAction;
 import com.bengalilkc.repository.lexicon.SynsetRepository;
+import com.bengalilkc.service.lexicon.SynsetDefinitionService;
+import com.bengalilkc.service.lexicon.WordnetRegistryService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
@@ -54,6 +57,8 @@ public class EntryValidator {
     private final SynsetRepository synsetRepository;
     private final NamedParameterJdbcTemplate jdbc;
     private final ObjectMapper objectMapper;
+    private final SynsetDefinitionService definitionService;
+    private final WordnetRegistryService registryService;
 
     /** Parsed entry; relation lists contain only complete rows. */
     public record EntryInput(
@@ -62,8 +67,8 @@ public class EntryValidator {
             SynsetAction action,
             String synsetId,
             String iliCode,
-            String definitionText,
-            DefinitionLanguage definitionLanguage,
+            /** Definitions to add, Bengali first; for a linked synset only languages it does not have yet. */
+            List<DefinitionPayload> definitions,
             String reviewerNote,
             List<SenseRelationPayload> senseRelations,
             List<SynsetRelationPayload> synsetRelations) {}
@@ -144,36 +149,18 @@ public class EntryValidator {
                 errors.put("iliCode", "The ILI code's POS suffix (-" + iliCode.charAt(iliCode.length() - 1)
                         + ") must match the selected part of speech (-" + pos.getCode() + ").");
             } else if (!NA.equals(iliCode)) {
-                String iliError = iliTaken(iliCode, excludeId);
+                String iliError = iliRegistryError(iliCode);
+                if (iliError == null) {
+                    iliError = iliTaken(iliCode, excludeId);
+                }
                 if (iliError != null) {
                     errors.put("iliCode", iliError);
                 }
             }
         }
 
-        boolean definitionLocked = linked != null && linked.getDefinitionText() != null
-                && !linked.getDefinitionText().isBlank();
-        String definitionText = definitionLocked ? null : blankToNull(str(p.get("definitionText")).strip());
-        DefinitionLanguage defLang = null;
-        if (definitionText != null) {
-            try {
-                defLang = DefinitionLanguage.from(str(p.get("definitionLanguage")));
-            } catch (Exception e) {
-                errors.put("definitionLanguage", "Select the definition language.");
-            }
-            int len = BengaliText.length(definitionText);
-            if (len < DEFINITION_MIN) {
-                errors.put("definitionText", "Definition must be at least " + DEFINITION_MIN + " characters.");
-            } else if (len > DEFINITION_MAX) {
-                errors.put("definitionText", "Definition must be at most " + DEFINITION_MAX + " characters.");
-            } else if (defLang == DefinitionLanguage.BEN
-                    && (!BengaliText.hasBengali(definitionText) || BengaliText.hasLatin(definitionText))) {
-                errors.put("definitionText", "A Bengali definition must be written in Bengali script.");
-            } else if (defLang == DefinitionLanguage.ENG
-                    && (!BengaliText.hasLatin(definitionText) || BengaliText.hasBengali(definitionText))) {
-                errors.put("definitionText", "An English definition must be written in English (Latin script).");
-            }
-        }
+        Set<String> existingLanguages = linked != null ? definitionService.languagesOf(linked.getId()) : Set.of();
+        List<DefinitionPayload> definitions = validateDefinitions(p, existingLanguages, errors);
 
         String reviewerNote = blankToNull(str(p.get("reviewerNote")).strip());
         if (reviewerNote != null && BengaliText.length(reviewerNote) > NOTE_MAX) {
@@ -187,7 +174,7 @@ public class EntryValidator {
         EntryInput in = new EntryInput(word, pos, action,
                 action == SynsetAction.LINK ? synsetId : null,
                 action == SynsetAction.CREATE ? iliCode : null,
-                definitionText, definitionText != null ? defLang : null,
+                definitions,
                 reviewerNote, List.copyOf(senseRels), List.copyOf(synsetRels));
 
         String near = null;
@@ -197,6 +184,87 @@ public class EntryValidator {
             near = checkDuplicates(in, linked, excludeId, errors);
         }
         return new Result(in, errors, near);
+    }
+
+    /** Error text when a real ILI code is not a Princeton WordNet 3.0 synset (or the registry is unavailable). */
+    public String iliRegistryError(String ili) {
+        if (!registryService.isLoaded()) {
+            return "The WordNet 3.0 ILI registry is not available right now. Try again in a minute, or select N/A.";
+        }
+        if (!registryService.exists(ili)) {
+            return "ILI " + ili + " is not a Princeton WordNet 3.0 synset. Use the ILI Finder to pick a valid code, "
+                    + "or select N/A.";
+        }
+        return null;
+    }
+
+    /**
+     * Definition rows ({@code definitions: [{language, text}]}; the legacy {@code definitionText} /
+     * {@code definitionLanguage} pair is read as one row). Row errors use keys {@code definitions.N}.
+     * At most one definition per language, and none in a language the linked synset already has.
+     */
+    private List<DefinitionPayload> validateDefinitions(
+            Map<String, Object> p, Set<String> existingLanguages, Map<String, String> errors) {
+        List<Map<?, ?>> rows = new ArrayList<>();
+        Object raw = p.get("definitions");
+        if (raw instanceof List<?> list) {
+            for (Object o : list) {
+                rows.add(o instanceof Map<?, ?> m ? m : Map.of());
+            }
+        } else {
+            String legacy = str(p.get("definitionText")).strip();
+            if (!legacy.isEmpty()) {
+                String lang = str(p.get("definitionLanguage")).trim();
+                rows.add(Map.of("language", lang.isEmpty() ? "ben" : lang, "text", legacy));
+            }
+        }
+        int max = SynsetDefinitionService.LANGUAGES.size();
+        if (rows.size() > max) {
+            errors.put("definitions", "A synset can have at most one definition per language (" + max + " in total).");
+            return List.of();
+        }
+        List<DefinitionPayload> out = new ArrayList<>();
+        Map<String, Integer> firstUse = new HashMap<>();
+        for (int i = 0; i < rows.size(); i++) {
+            String key = "definitions." + i;
+            String lang = null;
+            try {
+                DefinitionLanguage dl = DefinitionLanguage.from(str(rows.get(i).get("language")));
+                lang = dl == null ? null : dl.getCode();
+            } catch (Exception ignored) {
+                // reported below
+            }
+            String text = str(rows.get(i).get("text")).strip();
+            if (lang == null) {
+                errors.put(key, "Select the definition language.");
+                continue;
+            }
+            String name = SynsetDefinitionService.languageName(lang);
+            if (existingLanguages.contains(lang)) {
+                errors.put(key, "The selected synset already has a " + name
+                        + " definition. Add a definition in another language, or remove this one.");
+            } else if (firstUse.containsKey(lang)) {
+                errors.put(key, "Only one definition per language: " + name + " is already used in definition "
+                        + (firstUse.get(lang) + 1) + ".");
+            } else {
+                firstUse.put(lang, i);
+                int len = BengaliText.length(text);
+                if (text.isEmpty()) {
+                    errors.put(key, "Write the " + name + " definition, or remove it.");
+                } else if (len < DEFINITION_MIN) {
+                    errors.put(key, "Definition must be at least " + DEFINITION_MIN + " characters.");
+                } else if (len > DEFINITION_MAX) {
+                    errors.put(key, "Definition must be at most " + DEFINITION_MAX + " characters.");
+                } else if ("ben".equals(lang) && (!BengaliText.hasBengali(text) || BengaliText.hasLatin(text))) {
+                    errors.put(key, "A Bengali definition must be written in Bengali script.");
+                } else if ("eng".equals(lang) && (!BengaliText.hasLatin(text) || BengaliText.hasBengali(text))) {
+                    errors.put(key, "An English definition must be written in English (Latin script).");
+                } else {
+                    out.add(new DefinitionPayload(lang, text));
+                }
+            }
+        }
+        return SynsetDefinitionService.sorted(out);
     }
 
     /** Error text when a real ILI is already registered in the lexicon or proposed by a live submission. */
@@ -251,7 +319,7 @@ public class EntryValidator {
 
         List<Map<String, Object>> subs = jdbc.queryForList("""
                 select s.id, s.state, s.synset_action, s.synset_id, lower(coalesce(s.ili_code, sy.ili)) as ili,
-                       s.definition_text, s.definition_language, s.sense_relations_json, s.synset_relations_json,
+                       s.definitions_json, s.sense_relations_json, s.synset_relations_json,
                        s.promoted_sense_id
                 from submission s
                 left join synset sy on sy.id = s.synset_id
@@ -311,13 +379,8 @@ public class EntryValidator {
         if (!sameLink) {
             return false;
         }
-        String def = blankToNull(str(s.get("definition_text")).strip());
-        if (!Objects.equals(in.definitionText(), def)) {
-            return false;
-        }
-        if (def != null && !Objects.equals(
-                in.definitionLanguage() != null ? in.definitionLanguage().getCode() : null,
-                s.get("definition_language"))) {
+        if (!new HashSet<>(in.definitions()).equals(
+                new HashSet<>(definitionService.read(str(s.get("definitions_json")))))) {
             return false;
         }
         return new HashSet<>(in.senseRelations()).equals(new HashSet<>(readSense(str(s.get("sense_relations_json")))))

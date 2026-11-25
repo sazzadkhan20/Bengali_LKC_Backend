@@ -24,13 +24,16 @@ public interface SynsetRepository extends JpaRepository<SynsetEntity, String> {
 
     List<SynsetEntity> findByIdStartingWith(String prefix, Pageable pageable);
 
-    @Query("""
-        select s from SynsetEntity s
-        where lower(s.definitionText) like lower(concat('%', :q, '%'))
-          and (:pos is null or s.partOfSpeech = :pos)
-        """)
+    /** Synsets with any definition (Bengali or English) containing {@code q}; {@code pos} is a code or null. */
+    @Query(value = """
+        select s.* from synset s
+        where exists (select 1 from synset_definition d
+                      where d.synset_id = s.id and lower(d.text) like lower(concat('%', :q, '%')))
+          and (cast(:pos as varchar) is null or s.part_of_speech = cast(:pos as varchar))
+        order by s.id
+        """, nativeQuery = true)
     List<SynsetEntity> searchByDefinition(
-            @Param("q") String q, @Param("pos") PartOfSpeech pos, Pageable pageable);
+            @Param("q") String q, @Param("pos") String pos, Pageable pageable);
 
     List<SynsetEntity> findByPartOfSpeech(PartOfSpeech pos);
 }

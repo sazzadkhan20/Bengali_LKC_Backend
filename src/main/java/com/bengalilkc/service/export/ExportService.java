@@ -10,6 +10,7 @@ import com.bengalilkc.repository.lexicon.LexiconRepository;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.IdGeneratorService;
+import com.bengalilkc.service.lexicon.SynsetDefinitionService;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.sql.Timestamp;
@@ -59,6 +60,7 @@ public class ExportService {
     private final IdGeneratorService idGeneratorService;
     private final AuditService auditService;
     private final NamedParameterJdbcTemplate jdbc;
+    private final SynsetDefinitionService definitionService;
 
     private record SenseRow(String senseId, String entryId, String writtenForm, String pos, String synsetId, boolean user) {}
 
@@ -449,19 +451,19 @@ public class ExportService {
                 synRels.computeIfAbsent(src, k -> new ArrayList<>()).add(new String[] {rs.getString(2), target});
             }
         });
+        Map<String, List<Map<String, Object>>> definitions = definitionService.bySynsetIds(synsetIds);
         jdbc.query("""
-                select id, ili, part_of_speech, lexicalized, definition_language, definition_text
+                select id, ili, part_of_speech, lexicalized
                 from synset where id in (:ids) order by id
                 """, new MapSqlParameterSource("ids", List.copyOf(synsetIds)), (RowCallbackHandler) rs -> {
             String id = rs.getString("id");
             xml.append("    <Synset id=\"").append(esc(id)).append("\" ili=\"").append(esc(rs.getString("ili")))
                     .append("\" partOfSpeech=\"").append(rs.getString("part_of_speech"))
                     .append("\" lexicalized=\"").append(rs.getBoolean("lexicalized")).append("\">\n");
-            String def = rs.getString("definition_text");
-            if (def != null) {
-                String lang = rs.getString("definition_language");
-                xml.append("      <Definition language=\"").append(lang != null ? lang : "ben")
-                        .append("\">").append(esc(def)).append("</Definition>\n");
+            // One <Definition> element per language (Bengali first).
+            for (Map<String, Object> def : definitions.getOrDefault(id, List.of())) {
+                xml.append("      <Definition language=\"").append(esc((String) def.get("language")))
+                        .append("\">").append(esc((String) def.get("text"))).append("</Definition>\n");
             }
             for (String[] rel : synRels.getOrDefault(id, List.of())) {
                 xml.append("      <SynsetRelation relType=\"").append(esc(rel[0]))
