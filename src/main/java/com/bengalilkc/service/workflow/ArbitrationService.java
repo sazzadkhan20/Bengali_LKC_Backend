@@ -26,6 +26,7 @@ import com.bengalilkc.security.PermissionMatrix;
 import com.bengalilkc.security.UserPrincipal;
 import com.bengalilkc.service.admin.AuditService;
 import com.bengalilkc.service.admin.IdGeneratorService;
+import com.bengalilkc.service.lexicon.SynsetDefinitionService;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
@@ -74,6 +75,7 @@ public class ArbitrationService {
     private final AuditService auditService;
     private final SubmissionService submissionService;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+    private final SynsetDefinitionService definitionService;
 
     public ArbitrationService(
             ArbitrationCaseRepository caseRepository,
@@ -85,7 +87,9 @@ public class ArbitrationService {
             IdGeneratorService idGeneratorService,
             AuditService auditService,
             @Lazy SubmissionService submissionService,
-            com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
+            com.fasterxml.jackson.databind.ObjectMapper objectMapper,
+            SynsetDefinitionService definitionService) {
+        this.definitionService = definitionService;
         this.objectMapper = objectMapper;
         this.caseRepository = caseRepository;
         this.voteRepository = voteRepository;
@@ -579,8 +583,9 @@ public class ArbitrationService {
         }
         if (q != null) {
             where.append(" and (lower(s.written_form) like :like escape '!'")
-                    .append(" or lower(coalesce(s.definition_text, '')) like :like escape '!'")
-                    .append(" or lower(coalesce(sy.definition_text, '')) like :like escape '!'")
+                    .append(" or lower(lkc_definitions_text(s.definitions_json)) like :like escape '!'")
+                    .append(" or exists (select 1 from synset_definition d where d.synset_id = s.synset_id")
+                    .append(" and lower(d.text) like :like escape '!')")
                     .append(" or lower(c.id) = :exact or lower(s.id) = :exact")
                     .append(" or lower(cu.name) like :like escape '!'")
                     .append(" or lower(coalesce(ru.name, '')) like :like escape '!')");
@@ -756,14 +761,19 @@ public class ArbitrationService {
         s.put("synsetId", sub.getSynsetId());
         String definition = sub.getDefinitionText();
         String ili = sub.getIliCode();
+        List<Map<String, Object>> synsetDefinitions = List.of();
         if (sub.getSynsetId() != null) {
             SynsetEntity sy = synsetRepository.findById(sub.getSynsetId()).orElse(null);
             if (sy != null) {
                 definition = definition != null ? definition : sy.getDefinitionText();
                 ili = sy.getIli();
+                synsetDefinitions = definitionService.forSynset(sy.getId());
             }
         }
         s.put("definition", definition);
+        // Existing definitions of the linked synset, then the ones this entry adds.
+        s.put("synsetDefinitions", synsetDefinitions);
+        s.put("definitions", SynsetDefinitionService.toMaps(definitionService.read(sub.getDefinitionsJson())));
         s.put("ili", ili);
         s.put("createdAt", sub.getCreatedAt() != null ? sub.getCreatedAt().toString() : null);
         m.put("submission", s);

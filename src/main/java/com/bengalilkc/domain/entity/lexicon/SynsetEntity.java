@@ -47,11 +47,14 @@ public class SynsetEntity {
     @Builder.Default
     private boolean lexicalized = true;
 
-    
-    @Column(name = "definition_language", length = 5)
+    /**
+     * Primary gloss (Bengali first, else English) — maintained by a database trigger from
+     * {@code synset_definition}, which holds every definition. Read-only here.
+     */
+    @Column(name = "definition_language", length = 5, insertable = false, updatable = false)
     private DefinitionLanguage definitionLanguage;
 
-    @Column(name = "definition_text", columnDefinition = "TEXT")
+    @Column(name = "definition_text", columnDefinition = "TEXT", insertable = false, updatable = false)
     private String definitionText;
 
     @Column(nullable = false)

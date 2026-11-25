@@ -42,7 +42,7 @@ public class TieCorrectionService {
                 .addValue("q", term)
                 .addValue("like", "%" + term.toLowerCase().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%");
         String search = term.isEmpty() ? "" : " and (lower(s.written_form) like :like or lower(c.id) like :like"
-                + " or lower(c.submission_id) like :like or lower(coalesce(s.definition_text, '')) like :like)";
+                + " or lower(c.submission_id) like :like or lower(lkc_definitions_text(s.definitions_json)) like :like)";
 
         List<Map<String, Object>> queue = jdbc.query(
                 "select c.id, c.submission_id, s.written_form, s.part_of_speech, s.definition_text, c.stage,"

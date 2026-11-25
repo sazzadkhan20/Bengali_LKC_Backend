@@ -52,8 +52,8 @@ public class LexiconStatsService {
                        (select count(*) from sense where origin = 'USER') as crowdsourced_senses,
                        (select count(*) from synset) as synsets,
                        (select count(*) from synset where origin = 'USER') as crowdsourced_synsets,
-                       (select count(*) from synset where definition_language = 'ben') as definitions_ben,
-                       (select count(*) from synset where definition_language = 'eng') as definitions_eng,
+                       (select count(*) from synset_definition where language = 'ben') as definitions_ben,
+                       (select count(*) from synset_definition where language = 'eng') as definitions_eng,
                        (select count(*) from (select lexical_entry_id from sense
                           group by lexical_entry_id having count(*) > 1) p) as polysemous_entries,
                        (select count(*) from synset_relation) as synset_relations,

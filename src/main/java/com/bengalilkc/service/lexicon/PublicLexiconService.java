@@ -46,6 +46,7 @@ public class PublicLexiconService {
 
     private final NamedParameterJdbcTemplate jdbc;
     private final LexiconStatsService statsService;
+    private final SynsetDefinitionService definitionService;
 
     // ------------------------------------------------------------------ stats
 
@@ -218,7 +219,8 @@ public class PublicLexiconService {
         }
         MapSqlParameterSource args = new MapSqlParameterSource("pat", "%" + escapeLike(query.toLowerCase()) + "%")
                 .addValue("needle", query.toLowerCase());
-        StringBuilder where = new StringBuilder(" where s.definition_text is not null and lower(s.definition_text) like :pat");
+        StringBuilder where = new StringBuilder(" where exists (select 1 from synset_definition d"
+                + " where d.synset_id = s.id and lower(d.text) like :pat)");
         if (!pos.isEmpty()) {
             where.append(" and s.part_of_speech in (:pos)");
             args.addValue("pos", pos);
@@ -228,7 +230,9 @@ public class PublicLexiconService {
         List<Map<String, Object>> items = synsetHits(
                 "select s.id, s.ili, s.part_of_speech, s.lexicalized, s.definition_language, s.definition_text, s.origin"
                         + " from synset s" + where
-                        + " order by strpos(lower(s.definition_text), :needle), length(s.definition_text), s.id"
+                        + " order by (select min(strpos(lower(d.text), :needle)) from synset_definition d"
+                        + " where d.synset_id = s.id and lower(d.text) like :pat),"
+                        + " length(coalesce(s.definition_text, '')), s.id"
                         + " limit :limit offset :offset", args, false);
         body.put("items", items);
         body.putAll(pageInfo(safePage, safeSize, total));
@@ -289,6 +293,7 @@ public class PublicLexiconService {
             throw ApiException.notFound("No sense with id " + id + ".");
         }
         Map<String, Object> hit = rows.get(0);
+        hit.put("definitions", definitionService.forSynset((String) hit.get("synsetId")));
         hit.put("relations", senseRelations(List.of(id)).getOrDefault(id, List.of()));
         return hit;
     }
@@ -341,8 +346,10 @@ public class PublicLexiconService {
         Map<String, List<Map<String, Object>>> senseRels = senseRelations(senseIds);
         Map<String, Members> synonyms = members(synsetIds, id, 8);
         Map<String, List<Map<String, Object>>> synsetRels = synsetRelations(synsetIds, 4);
+        Map<String, List<Map<String, Object>>> definitions = definitionService.bySynsetIds(synsetIds);
         for (Map<String, Object> s : senses) {
             String syn = (String) s.get("synsetId");
+            s.put("definitions", definitions.getOrDefault(syn, List.of()));
             Members mem = synonyms.getOrDefault(syn, Members.EMPTY);
             s.put("synonyms", mem.words());
             s.put("synonymCount", mem.total());
@@ -385,6 +392,7 @@ public class PublicLexiconService {
             throw ApiException.notFound("Synset not found.");
         }
         Map<String, Object> syn = rows.get(0);
+        syn.put("definitions", definitionService.forSynset(id));
         Members mem = members(List.of(id), null, 200).getOrDefault(id, Members.EMPTY);
         syn.put("words", mem.words());
         syn.put("wordCount", mem.total());
@@ -465,7 +473,10 @@ public class PublicLexiconService {
             c.put("definition", truncate(rs.getString("definition_text"), 180));
             c.put("defLang", rs.getString("definition_language"));
         });
+        Map<String, List<Map<String, Object>>> definitions = definitionService.bySynsetIds(
+                cards.stream().map(c -> (String) c.get("synsetId")).filter(java.util.Objects::nonNull).toList());
         for (Map<String, Object> c : cards) {
+            c.put("definitions", definitions.getOrDefault((String) c.get("synsetId"), List.of()));
             c.putIfAbsent("senseCount", 0);
             c.putIfAbsent("crowdsourced", false);
             c.putIfAbsent("validatedAt", null);
@@ -488,8 +499,11 @@ public class PublicLexiconService {
             m.put("crowdsourced", "USER".equals(rs.getString("origin")));
             return m;
         });
-        Map<String, Members> words = members(items.stream().map(m -> (String) m.get("synsetId")).toList(), null, 12);
+        List<String> hitIds = items.stream().map(m -> (String) m.get("synsetId")).toList();
+        Map<String, Members> words = members(hitIds, null, 12);
+        Map<String, List<Map<String, Object>>> definitions = definitionService.bySynsetIds(hitIds);
         for (Map<String, Object> m : items) {
+            m.put("definitions", definitions.getOrDefault((String) m.get("synsetId"), List.of()));
             Members mem = words.getOrDefault((String) m.get("synsetId"), Members.EMPTY);
             m.put("entries", mem.words());
             m.put("entryCount", mem.total());

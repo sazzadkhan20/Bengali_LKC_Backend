@@ -1,5 +1,6 @@
 package com.bengalilkc.service.workflow;
 
+import com.bengalilkc.common.DefinitionPayload;
 import com.bengalilkc.common.SenseRelationPayload;
 import com.bengalilkc.common.SynsetRelationPayload;
 import com.bengalilkc.common.exception.ApiException;
@@ -25,6 +26,7 @@ import com.bengalilkc.service.admin.CaptchaService;
 import com.bengalilkc.service.admin.ConfigService;
 import com.bengalilkc.service.admin.IdGeneratorService;
 import com.bengalilkc.service.community.LeaderboardService;
+import com.bengalilkc.service.lexicon.SynsetDefinitionService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Instant;
@@ -86,6 +88,7 @@ public class SubmissionService {
     private final AppUserRepository userRepository;
     private final QuotaService quotaService;
     private final CaptchaService captchaService;
+    private final SynsetDefinitionService definitionService;
 
     public SubmissionService(
             SubmissionRepository submissionRepository,
@@ -100,7 +103,9 @@ public class SubmissionService {
             ObjectMapper objectMapper,
             AppUserRepository userRepository,
             QuotaService quotaService,
-            CaptchaService captchaService) {
+            CaptchaService captchaService,
+            SynsetDefinitionService definitionService) {
+        this.definitionService = definitionService;
         this.userRepository = userRepository;
         this.quotaService = quotaService;
         this.captchaService = captchaService;
@@ -528,8 +533,8 @@ public class SubmissionService {
                     after = linkage(in.action(), in.synsetId(), in.iliCode());
                 }
                 case "definition" -> {
-                    before = definitionLabel(sub.getDefinitionLanguage(), sub.getDefinitionText());
-                    after = definitionLabel(in.definitionLanguage(), in.definitionText());
+                    before = SynsetDefinitionService.label(definitionService.read(sub.getDefinitionsJson()));
+                    after = SynsetDefinitionService.label(in.definitions());
                 }
                 case "sense relations" -> {
                     before = relationsLabel(readSense(sub.getSenseRelationsJson()).stream()
@@ -564,13 +569,6 @@ public class SubmissionService {
             return "New synset" + (iliCode == null || iliCode.isBlank() ? "" : " (ILI " + iliCode + ")");
         }
         return synsetId == null ? null : "Linked to " + synsetId;
-    }
-
-    private static String definitionLabel(DefinitionLanguage lang, String text) {
-        if (text == null || text.isBlank()) {
-            return null;
-        }
-        return (lang == null ? "" : "[" + lang.getCode() + "] ") + text;
     }
 
     private static String relationsLabel(List<String> rels) {
@@ -803,8 +801,7 @@ public class SubmissionService {
         p.put("synsetAction", sub.getSynsetAction() != null ? sub.getSynsetAction().getCode() : null);
         p.put("synsetId", sub.getSynsetId());
         p.put("iliCode", sub.getIliCode());
-        p.put("definitionText", sub.getDefinitionText());
-        p.put("definitionLanguage", sub.getDefinitionLanguage() != null ? sub.getDefinitionLanguage().getCode() : null);
+        p.put("definitions", SynsetDefinitionService.toMaps(definitionService.read(sub.getDefinitionsJson())));
         p.put("reviewerNote", sub.getReviewerNote());
         p.put("senseRelations", readSense(sub.getSenseRelationsJson()));
         p.put("synsetRelations", readSynset(sub.getSynsetRelationsJson()));
@@ -817,8 +814,12 @@ public class SubmissionService {
         sub.setSynsetAction(in.action());
         sub.setSynsetId(in.synsetId());
         sub.setIliCode(in.iliCode());
-        sub.setDefinitionText(in.definitionText());
-        sub.setDefinitionLanguage(in.definitionLanguage());
+        List<DefinitionPayload> definitions = SynsetDefinitionService.sorted(in.definitions());
+        sub.setDefinitionsJson(definitionService.write(definitions));
+        // Legacy columns keep the primary definition (Bengali first) for older readers.
+        DefinitionPayload primary = definitions.isEmpty() ? null : definitions.get(0);
+        sub.setDefinitionText(primary != null ? primary.text() : null);
+        sub.setDefinitionLanguage(primary != null ? DefinitionLanguage.from(primary.language()) : null);
         sub.setReviewerNote(in.reviewerNote());
         sub.setSenseRelationsJson(writeJson(in.senseRelations()));
         sub.setSynsetRelationsJson(writeJson(in.synsetRelations()));
@@ -838,8 +839,8 @@ public class SubmissionService {
                 || !java.util.Objects.equals(sub.getIliCode(), in.iliCode())) {
             out.add("synset linkage");
         }
-        if (!java.util.Objects.equals(sub.getDefinitionText(), in.definitionText())
-                || (in.definitionText() != null && sub.getDefinitionLanguage() != in.definitionLanguage())) {
+        if (!new java.util.HashSet<>(definitionService.read(sub.getDefinitionsJson()))
+                .equals(new java.util.HashSet<>(in.definitions()))) {
             out.add("definition");
         }
         if (!new java.util.HashSet<>(readSense(sub.getSenseRelationsJson()))
@@ -910,8 +911,10 @@ public class SubmissionService {
         m.put("synsetAction", s.getSynsetAction() != null ? s.getSynsetAction().getCode() : null);
         m.put("synsetId", s.getSynsetId());
         m.put("iliCode", s.getIliCode());
-        m.put("definitionLanguage", s.getDefinitionLanguage() != null ? s.getDefinitionLanguage().getCode() : null);
-        m.put("definitionText", s.getDefinitionText());
+        List<DefinitionPayload> definitions = definitionService.read(s.getDefinitionsJson());
+        m.put("definitions", SynsetDefinitionService.toMaps(definitions));
+        m.put("definitionLanguage", definitions.isEmpty() ? null : definitions.get(0).language());
+        m.put("definitionText", definitions.isEmpty() ? null : definitions.get(0).text());
         m.put("senseRelations", readSense(s.getSenseRelationsJson()));
         m.put("synsetRelations", readSynset(s.getSynsetRelationsJson()));
         m.put("reviewerNote", s.getReviewerNote());
